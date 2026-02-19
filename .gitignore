@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+.astro/
+*.tsbuildinfo
+coverage/
+reports/
+
+# Tauri / Rust artifacts
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# Test artifacts
+frontend/wdio.log
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+
+# Local databases and logs
+*.db
+*.sqlite3
+*.log
+*.log.*
+# OS files
+.DS_Store
+Thumbs.db

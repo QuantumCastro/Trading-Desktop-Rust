@@ -1,0 +1,37 @@
+[package]
+name = "desktop-template"
+version = "0.1.0"
+description = "Desktop template runtime powered by Tauri 2 + Rust"
+authors = ["Desktop Template"]
+edition = "2021"
+
+[lib]
+name = "desktop_template_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+futures-util = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+simd-json = { version = "0.14", features = ["serde_impl"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "migrate"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-websocket = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

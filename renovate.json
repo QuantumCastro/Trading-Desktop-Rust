@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":maintainLockFilesWeekly",
+    ":semanticCommits",
+    ":prHourlyLimit2"
+  ],
+  "timezone": "America/Costa_Rica",
+  "dependencyDashboard": true,
+  "rebaseWhen": "conflicted",
+  "platformAutomerge": false,
+  "packageRules": [
+    {
+      "description": "1. Desactivar actualizaciones Major completamente",
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "2. Agrupar todas las Minor diariamente",
+      "matchPackagePatterns": ["*"],
+      "matchUpdateTypes": ["minor"],
+      "groupName": "Daily Minor Updates",
+      "groupSlug": "all-minor",
+      "schedule": ["at 5am"],
+      "automerge": true
+    },
+    {
+      "description": "3. Agrupar todas las Patch diariamente",
+      "matchPackagePatterns": ["*"],
+      "matchUpdateTypes": ["patch", "pin", "digest"],
+      "groupName": "Daily Patch Updates",
+      "groupSlug": "all-patch",
+      "schedule": ["at 5am"],
+      "automerge": true
+    },
+    {
+      "description": "4. Herramientas de calidad (se mantienen agrupadas si prefieres separarlas del bulto)",
+      "matchPackagePatterns": ["^eslint", "^prettier", "^ruff", "^mypy"],
+      "groupName": "code-quality-tools"
+    },
+    {
+      "description": "5. Dependencias Rust y Tauri",
+      "matchManagers": ["cargo", "npm"],
+      "enabled": true
+    }
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["at 5am on monday"]
+  },
+  "npm": {
+    "enabled": true,
+    "rangeStrategy": "bump"
+  }
+}

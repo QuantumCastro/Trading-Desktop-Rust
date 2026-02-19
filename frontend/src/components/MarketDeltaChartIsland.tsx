@@ -1,0 +1,182 @@
+import { useStore } from "@nanostores/react";
+import {
+  createChart,
+  LineStyle,
+  type CandlestickData,
+  type IChartApi,
+  type ISeriesApi,
+  type UTCTimestamp,
+} from "lightweight-charts";
+import { useEffect, useRef } from "react";
+import type { UiDeltaCandle } from "@lib/ipc/contracts";
+import {
+  $marketDeltaCandles,
+  $marketDeltaLiveUpdate,
+  $marketSymbol,
+  $marketTimeframe,
+  $marketVisibleLogicalRange,
+} from "@lib/market/store";
+
+const toUtcTimestamp = (timestamp: number): UTCTimestamp => {
+  const normalized =
+    Math.abs(timestamp) >= 1_000_000_000_000
+      ? Math.floor(timestamp / 1_000)
+      : Math.floor(timestamp);
+  return Math.max(1, normalized) as UTCTimestamp;
+};
+
+const DELTA_CHART_HEIGHT_PX = 141;
+
+const toDeltaPoint = (candle: UiDeltaCandle): CandlestickData<UTCTimestamp> => ({
+  time: toUtcTimestamp(candle.t),
+  open: candle.o,
+  high: candle.h,
+  low: candle.l,
+  close: candle.c,
+});
+
+const hasTauriRuntime = (): boolean => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return "__TAURI_INTERNALS__" in window;
+};
+
+export const MarketDeltaChartIsland = () => {
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const deltaSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const symbol = useStore($marketSymbol);
+  const timeframe = useStore($marketTimeframe);
+  const deltaCandles = useStore($marketDeltaCandles);
+  const visibleRange = useStore($marketVisibleLogicalRange);
+
+  useEffect(() => {
+    const container = chartContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const chart = createChart(container, {
+      width: Math.max(container.clientWidth, 320),
+      height: DELTA_CHART_HEIGHT_PX,
+      layout: {
+        background: { color: "#ffffff" },
+        textColor: "#0f172a",
+      },
+      grid: {
+        vertLines: { color: "#e2e8f0" },
+        horzLines: { color: "#e2e8f0" },
+      },
+      rightPriceScale: {
+        borderColor: "#cbd5e1",
+      },
+      timeScale: {
+        borderColor: "#cbd5e1",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      handleScroll: false,
+      handleScale: {
+        axisPressedMouseMove: {
+          time: false,
+          price: true,
+        },
+        mouseWheel: false,
+        pinch: false,
+        axisDoubleClickReset: true,
+      },
+    });
+
+    const deltaSeries = chart.addCandlestickSeries({
+      upColor: "#16a34a",
+      borderUpColor: "#16a34a",
+      wickUpColor: "#16a34a",
+      downColor: "#dc2626",
+      borderDownColor: "#dc2626",
+      wickDownColor: "#dc2626",
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    deltaSeries.createPriceLine({
+      price: 0,
+      color: "#64748b",
+      lineStyle: LineStyle.Dotted,
+      lineWidth: 1,
+      axisLabelVisible: true,
+      title: "0",
+    });
+
+    chartRef.current = chart;
+    deltaSeriesRef.current = deltaSeries;
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (!chartContainerRef.current || !chartRef.current) {
+        return;
+      }
+      chartRef.current.applyOptions({
+        width: Math.max(chartContainerRef.current.clientWidth, 320),
+        height: DELTA_CHART_HEIGHT_PX,
+      });
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      deltaSeriesRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) {
+      return;
+    }
+    if (!visibleRange) {
+      return;
+    }
+    chart.timeScale().setVisibleLogicalRange(visibleRange);
+  }, [visibleRange]);
+
+  useEffect(() => {
+    const series = deltaSeriesRef.current;
+    if (!series) {
+      return;
+    }
+    series.setData(deltaCandles.map(toDeltaPoint));
+  }, [deltaCandles]);
+
+  useEffect(() => {
+    const unlisten = $marketDeltaLiveUpdate.listen((update) => {
+      if (!update) {
+        return;
+      }
+      deltaSeriesRef.current?.update(toDeltaPoint(update.candle));
+    });
+
+    return () => {
+      unlisten();
+    };
+  }, []);
+
+  return (
+    <section className="w-full rounded-md border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+      <div className="mb-1 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300">
+        <span className="font-semibold uppercase tracking-wide">Delta Volume</span>
+        <span>
+          {symbol} | {timeframe}
+        </span>
+      </div>
+      <div className="h-[141px] w-full" data-testid="market-delta-chart" ref={chartContainerRef} />
+      {!hasTauriRuntime() ? (
+        <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900">
+          El panel Delta requiere runtime Tauri.
+        </div>
+      ) : null}
+    </section>
+  );
+};
+
+export default MarketDeltaChartIsland;

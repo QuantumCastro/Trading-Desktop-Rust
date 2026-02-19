@@ -1,0 +1,84 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "shell": {
+      "executable": "pwsh",
+      "args": ["-NoProfile", "-Command"]
+    }
+  },
+  "tasks": [
+    {
+      "label": "Setup: deps (pnpm)",
+      "type": "shell",
+      "command": "pnpm install",
+      "problemMatcher": []
+    },
+    {
+      "label": "Frontend: lint (eslint)",
+      "type": "shell",
+      "command": "pnpm --dir frontend lint",
+      "problemMatcher": []
+    },
+    {
+      "label": "Frontend: type-check",
+      "type": "shell",
+      "command": "pnpm --dir frontend type-check",
+      "problemMatcher": []
+    },
+    {
+      "label": "Frontend: tests (vitest)",
+      "type": "shell",
+      "command": "pnpm --dir frontend test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Frontend: build (SSG)",
+      "type": "shell",
+      "command": "pnpm --dir frontend build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Desktop: tauri dev",
+      "type": "shell",
+      "command": "pnpm --dir frontend tauri:dev",
+      "problemMatcher": []
+    },
+    {
+      "label": "Rust: fmt check",
+      "type": "shell",
+      "command": "cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --all --check",
+      "problemMatcher": []
+    },
+    {
+      "label": "Rust: clippy",
+      "type": "shell",
+      "command": "cargo clippy --manifest-path frontend/src-tauri/Cargo.toml --all-targets -- -D warnings",
+      "problemMatcher": []
+    },
+    {
+      "label": "Rust: tests",
+      "type": "shell",
+      "command": "cargo test --manifest-path frontend/src-tauri/Cargo.toml",
+      "problemMatcher": []
+    },
+    {
+      "label": "Desktop: E2E (WebdriverIO)",
+      "type": "shell",
+      "command": "pnpm --dir frontend test:e2e",
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify (all gates)",
+      "dependsOn": [
+        "Frontend: lint (eslint)",
+        "Frontend: type-check",
+        "Frontend: tests (vitest)",
+        "Frontend: build (SSG)",
+        "Rust: fmt check",
+        "Rust: clippy",
+        "Rust: tests"
+      ],
+      "dependsOrder": "sequence"
+    }
+  ]
+}

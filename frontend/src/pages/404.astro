@@ -1,0 +1,21 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+---
+
+<BaseLayout>
+  <main
+    class="mx-auto flex min-h-[60vh] max-w-2xl flex-col items-start justify-center gap-4 px-4 py-12"
+  >
+    <p class="text-sm font-medium uppercase tracking-wide text-slate-500">404</p>
+    <h1 class="text-3xl font-semibold text-slate-900">No encontramos esta pagina</h1>
+    <p class="text-base text-slate-700">
+      El recurso no existe o la URL cambio. Revisa la ruta o vuelve al inicio.
+    </p>
+    <a
+      class="inline-flex items-center justify-center rounded-md bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+      href="/"
+    >
+      Volver al inicio
+    </a>
+  </main>
+</BaseLayout>

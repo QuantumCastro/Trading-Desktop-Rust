@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.1.0
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.25.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir frontend lint
+      - run: pnpm --dir frontend type-check
+      - run: pnpm --dir frontend test
+      - run: pnpm --dir frontend build
+
+  rust-core:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          if apt-cache show libwebkit2gtk-4.1-dev >/dev/null 2>&1; then
+            sudo apt-get install -y libwebkit2gtk-4.1-dev
+          else
+            sudo apt-get install -y libwebkit2gtk-4.0-dev
+          fi
+
+      - name: Ensure frontendDist exists for Tauri macro checks
+        shell: pwsh
+        run: |
+          $distDir = Join-Path $PWD "frontend/dist"
+          if (-not (Test-Path $distDir)) {
+            New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+          }
+
+          $indexPath = Join-Path $distDir "index.html"
+          if (-not (Test-Path $indexPath)) {
+            Set-Content -Path $indexPath -NoNewline -Value "<!doctype html><html><head><meta charset='utf-8' /></head><body></body></html>"
+          }
+
+      - name: Rust fmt
+        run: cargo fmt --manifest-path frontend/src-tauri/Cargo.toml --all --check
+
+      - name: Rust clippy
+        run: cargo clippy --manifest-path frontend/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --manifest-path frontend/src-tauri/Cargo.toml
+
+      - name: Rust check
+        run: cargo check --manifest-path frontend/src-tauri/Cargo.toml
+
+  e2e-tauri:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.1.0
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.25.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install tauri-driver and export path
+        shell: pwsh
+        run: |
+          cargo install tauri-driver --locked
+          $tauriDriverPath = Join-Path $env:USERPROFILE ".cargo\bin\tauri-driver.exe"
+          if (-not (Test-Path $tauriDriverPath)) {
+            throw "No se encontro tauri-driver en '$tauriDriverPath' despues de instalar."
+          }
+          "TAURI_DRIVER_BIN=$tauriDriverPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install EdgeDriver and export path
+        shell: pwsh
+        run: |
+          function Resolve-WingetEdgeDriverPath {
+            $packagesRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+            if (-not (Test-Path $packagesRoot)) {
+              return $null
+            }
+
+            $packageDirs = Get-ChildItem -Path $packagesRoot -Directory -Filter "Microsoft.EdgeDriver*" -ErrorAction SilentlyContinue
+            foreach ($dir in $packageDirs) {
+              $exe = Get-ChildItem -Path $dir.FullName -Recurse -File -Filter "msedgedriver.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($exe) {
+                return $exe.FullName
+              }
+            }
+
+            return $null
+          }
+
+          $driverPath = Resolve-WingetEdgeDriverPath
+          if (-not $driverPath) {
+            winget install --id Microsoft.EdgeDriver --exact --silent --accept-package-agreements --accept-source-agreements
+            $driverPath = Resolve-WingetEdgeDriverPath
+          }
+
+          if (-not $driverPath) {
+            throw "No se encontro msedgedriver.exe despues de la instalacion con winget."
+          }
+
+          "TAURI_NATIVE_DRIVER_PATH=$driverPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run desktop E2E (WebdriverIO + Tauri driver)
+        run: pnpm --dir frontend test:e2e

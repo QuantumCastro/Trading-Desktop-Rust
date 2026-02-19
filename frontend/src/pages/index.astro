@@ -1,0 +1,12 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import MarketPriceChartIsland from "../components/MarketPriceChartIsland";
+import MarketDeltaChartIsland from "../components/MarketDeltaChartIsland";
+---
+
+<BaseLayout>
+  <main class="flex min-h-[60vh] w-full flex-col gap-1 px-0 py-0">
+    <MarketPriceChartIsland client:only="react" />
+    <MarketDeltaChartIsland client:only="react" />
+  </main>
+</BaseLayout>
