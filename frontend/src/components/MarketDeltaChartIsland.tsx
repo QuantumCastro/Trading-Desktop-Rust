@@ -15,6 +15,8 @@ import {
   $marketSymbol,
   $marketTimeframe,
   $marketVisibleLogicalRange,
+  clearMarketSharedCrosshairBySource,
+  setMarketSharedCrosshair,
 } from "@lib/market/store";
 
 const toUtcTimestamp = (timestamp: number): UTCTimestamp => {
@@ -110,6 +112,24 @@ export const MarketDeltaChartIsland = () => {
     chartRef.current = chart;
     deltaSeriesRef.current = deltaSeries;
 
+    const onCrosshairMove = (param: { point?: { x: number; y: number } | null }) => {
+      const point = param.point;
+      const containerElement = chartContainerRef.current;
+      if (!point || !containerElement) {
+        clearMarketSharedCrosshairBySource("delta");
+        return;
+      }
+
+      const bounds = containerElement.getBoundingClientRect();
+      setMarketSharedCrosshair({
+        visible: true,
+        screenX: bounds.left + point.x,
+        source: "delta",
+      });
+    };
+
+    chart.subscribeCrosshairMove(onCrosshairMove);
+
     const resizeObserver = new ResizeObserver(() => {
       if (!chartContainerRef.current || !chartRef.current) {
         return;
@@ -123,6 +143,8 @@ export const MarketDeltaChartIsland = () => {
 
     return () => {
       resizeObserver.disconnect();
+      chart.unsubscribeCrosshairMove(onCrosshairMove);
+      clearMarketSharedCrosshairBySource("delta");
       chart.remove();
       chartRef.current = null;
       deltaSeriesRef.current = null;

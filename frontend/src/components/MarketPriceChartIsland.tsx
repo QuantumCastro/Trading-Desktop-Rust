@@ -23,18 +23,33 @@ import {
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import type { MarketConnectionState, MarketTimeframe, UiCandle } from "@lib/ipc/contracts";
+import type {
+  MarketConnectionState,
+  MarketDrawingsScopeArgs,
+  MarketKind,
+  MarketTimeframe,
+  UiCandle,
+} from "@lib/ipc/contracts";
 import {
-  invokeMarketSpotSymbols,
+  invokeMarketDrawingDelete,
+  invokeMarketDrawingUpsert,
+  invokeMarketDrawingsList,
+  invokeMarketPreferencesGet,
+  invokeMarketPreferencesSave,
+  invokeMarketSymbols,
   invokeStartMarketStream,
   invokeStopMarketStream,
 } from "@lib/ipc/invoke";
 import { listenMarketEvents } from "@lib/ipc/market-events";
 import {
+  $marketDrawings,
+  $marketKind,
+  $marketMagnetStrong,
   $marketAdjustedNetworkLatencyMs,
   $marketConnectionState,
   $marketLastAggId,
@@ -45,11 +60,20 @@ import {
   applyDeltaCandlesBootstrap,
   applyMarketPerfSnapshot,
   applyMarketStatus,
+  clearMarketSharedCrosshairBySource,
   resetMarketStatus,
+  setMarketSharedCrosshair,
   setMarketFrontendRenderLatency,
   setMarketVisibleLogicalRange,
   upsertDeltaCandle,
 } from "@lib/market/store";
+import {
+  createDrawingId,
+  drawingFromDto,
+  drawingToUpsertArgs,
+  type DrawingPoint,
+  type PersistedDrawing,
+} from "@lib/market/drawings";
 
 const DEFAULT_STREAM_ARGS = {
   symbol: "BTCUSDT",
@@ -81,53 +105,6 @@ type ChartToolOption = {
 
 type DrawableTool = Exclude<ChartTool, "selection">;
 
-type DrawingPoint = {
-  time: UTCTimestamp;
-  price: number;
-};
-
-type TrendLineDrawing = {
-  id: string;
-  type: "trendLine";
-  start: DrawingPoint;
-  end: DrawingPoint;
-};
-
-type HorizontalLineDrawing = {
-  id: string;
-  type: "horizontalLine";
-  price: number;
-};
-
-type RulerDrawing = {
-  id: string;
-  type: "ruler";
-  start: DrawingPoint;
-  end: DrawingPoint;
-};
-
-type FibRetracementDrawing = {
-  id: string;
-  type: "fibRetracement";
-  start: DrawingPoint;
-  end: DrawingPoint;
-};
-
-type FibExtensionDrawing = {
-  id: string;
-  type: "fibExtension";
-  first: DrawingPoint;
-  second: DrawingPoint;
-  third: DrawingPoint;
-};
-
-type PersistedDrawing =
-  | TrendLineDrawing
-  | HorizontalLineDrawing
-  | RulerDrawing
-  | FibRetracementDrawing
-  | FibExtensionDrawing;
-
 type DragDraft = {
   kind: "drag";
   tool: Exclude<DrawableTool, "fibExtension" | "horizontalLine">;
@@ -143,6 +120,21 @@ type FibExtensionDraft = {
 };
 
 type DrawingDraft = DragDraft | FibExtensionDraft;
+
+type DrawingHit = {
+  drawingId: string;
+  kind: "handle" | "body";
+  handleIndex: number | null;
+};
+
+type SelectedDrawingDrag = {
+  pointerId: number;
+  drawingId: string;
+  anchor: DrawingPoint;
+  snapshot: PersistedDrawing;
+  kind: "handle" | "body";
+  handleIndex: number | null;
+};
 
 type CanvasPoint = {
   x: number;
@@ -174,6 +166,11 @@ const TIMEFRAME_OPTIONS: ReadonlyArray<{ value: MarketTimeframe; label: string }
   { value: "1d", label: "1D" },
   { value: "1w", label: "1w" },
   { value: "1M", label: "1M" },
+];
+
+const MARKET_KIND_OPTIONS: ReadonlyArray<{ value: MarketKind; label: string }> = [
+  { value: "spot", label: "Spot" },
+  { value: "futures_usdm", label: "Futures USDM" },
 ];
 
 const FIB_RETRACEMENT_LEVELS: ReadonlyArray<number> = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
@@ -224,11 +221,27 @@ const hasFiniteNumber = (value: number | null): value is number =>
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(Math.max(value, min), max);
 
-const createDrawingId = (): string => {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
+const distance = (a: CanvasPoint, b: CanvasPoint): number => {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+};
+
+const distanceToSegment = (p: CanvasPoint, a: CanvasPoint, b: CanvasPoint): number => {
+  const abx = b.x - a.x;
+  const aby = b.y - a.y;
+  const apx = p.x - a.x;
+  const apy = p.y - a.y;
+  const squaredLength = abx * abx + aby * aby;
+  if (squaredLength <= Number.EPSILON) {
+    return distance(p, a);
   }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const projected = clamp((apx * abx + apy * aby) / squaredLength, 0, 1);
+  const nearest = {
+    x: a.x + abx * projected,
+    y: a.y + aby * projected,
+  };
+  return distance(p, nearest);
 };
 
 const formatSigned = (value: number, decimals = 2): string => {
@@ -462,19 +475,35 @@ export const MarketPriceChartIsland = () => {
   const candleTimestampsRef = useRef<ReadonlyArray<UTCTimestamp>>([]);
   const hasBootstrapCandlesRef = useRef(false);
   const pendingLiveCandlesRef = useRef<Map<number, UiCandle>>(new Map());
+  const drawingCreatedAtRef = useRef<Map<string, number>>(new Map());
+  const selectedDrawingDragRef = useRef<SelectedDrawingDrag | null>(null);
+  const selectedDrawingIdRef = useRef<string | null>(null);
+  const drawingLoadRequestRef = useRef(0);
+  const symbolsLoadingRef = useRef(false);
+  const settingsSaveTimerRef = useRef<number | null>(null);
+  const drawingStyleSaveTimerRef = useRef<number | null>(null);
+  const isHydratedRef = useRef(false);
+  const requestedMarketKindRef = useRef<MarketKind>("spot");
   const isMagnetStrongRef = useRef(false);
   const hasStartedRef = useRef(false);
   const requestedTimeframeRef = useRef<MarketTimeframe>("1m");
   const requestedSymbolRef = useRef<string>(DEFAULT_STREAM_ARGS.symbol);
+  const desiredMarketKindRef = useRef<MarketKind>("spot");
+  const desiredTimeframeRef = useRef<MarketTimeframe>("1m");
+  const desiredSymbolRef = useRef<string>(DEFAULT_STREAM_ARGS.symbol);
   const timeframeRef = useRef<MarketTimeframe>("1m");
   const [selectedTool, setSelectedTool] = useState<ChartTool>("selection");
   const [isMagnetStrong, setIsMagnetStrong] = useState(false);
-  const [spotSymbols, setSpotSymbols] = useState<ReadonlyArray<string>>([
+  const [isSymbolsLoading, setIsSymbolsLoading] = useState(false);
+  const [marketSymbols, setMarketSymbols] = useState<ReadonlyArray<string>>([
     DEFAULT_STREAM_ARGS.symbol,
   ]);
+  const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
 
+  const marketKind = useStore($marketKind);
   const symbol = useStore($marketSymbol);
   const timeframe = useStore($marketTimeframe);
+  const drawings = useStore($marketDrawings);
 
   const rebuildCandleIndex = (candles: ReadonlyArray<UiCandle>) => {
     const nextMap = new Map<UTCTimestamp, CandleSnapshot>();
@@ -550,6 +579,160 @@ export const MarketPriceChartIsland = () => {
       }
     }
   };
+
+  const activeScope = useMemo<MarketDrawingsScopeArgs>(
+    () => ({
+      marketKind,
+      symbol,
+      timeframe,
+    }),
+    [marketKind, symbol, timeframe],
+  );
+
+  const selectedDrawing = useMemo(
+    () => drawings.find((drawing) => drawing.id === selectedDrawingId) ?? null,
+    [drawings, selectedDrawingId],
+  );
+
+  const setDrawings = (nextDrawings: ReadonlyArray<PersistedDrawing>) => {
+    drawingsRef.current = nextDrawings;
+    $marketDrawings.set(nextDrawings);
+    if (
+      selectedDrawingIdRef.current !== null &&
+      !nextDrawings.some((drawing) => drawing.id === selectedDrawingIdRef.current)
+    ) {
+      selectedDrawingIdRef.current = null;
+      setSelectedDrawingId(null);
+    }
+  };
+
+  const updateDrawingById = (
+    drawingId: string,
+    updater: (drawing: PersistedDrawing) => PersistedDrawing,
+  ): PersistedDrawing | null => {
+    let updated: PersistedDrawing | null = null;
+    const nextDrawings = drawingsRef.current.map((drawing) => {
+      if (drawing.id !== drawingId) {
+        return drawing;
+      }
+      updated = updater(drawing);
+      return updated;
+    });
+
+    if (!updated) {
+      return null;
+    }
+
+    setDrawings(nextDrawings);
+    return updated;
+  };
+
+  const persistDrawing = useCallback(
+    async (drawing: PersistedDrawing, scope: MarketDrawingsScopeArgs) => {
+      try {
+        const createdAtMs = drawingCreatedAtRef.current.get(drawing.id);
+        const dto = await invokeMarketDrawingUpsert(
+          drawingToUpsertArgs(drawing, scope, createdAtMs),
+        );
+        drawingCreatedAtRef.current.set(dto.id, dto.createdAtMs);
+      } catch (error) {
+        console.error("No se pudo persistir drawing", error);
+      }
+    },
+    [],
+  );
+
+  const persistSelectedDrawingStyle = (
+    drawing: PersistedDrawing,
+    scope: MarketDrawingsScopeArgs,
+  ) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (drawingStyleSaveTimerRef.current !== null) {
+      window.clearTimeout(drawingStyleSaveTimerRef.current);
+    }
+    drawingStyleSaveTimerRef.current = window.setTimeout(() => {
+      drawingStyleSaveTimerRef.current = null;
+      void persistDrawing(drawing, scope);
+    }, 250);
+  };
+
+  const deleteDrawingById = useCallback(
+    async (drawingId: string, scope: MarketDrawingsScopeArgs) => {
+      const nextDrawings = drawingsRef.current.filter((drawing) => drawing.id !== drawingId);
+      setDrawings(nextDrawings);
+      selectedDrawingIdRef.current = null;
+      setSelectedDrawingId(null);
+      try {
+        await invokeMarketDrawingDelete({
+          id: drawingId,
+          marketKind: scope.marketKind,
+          symbol: scope.symbol,
+          timeframe: scope.timeframe,
+        });
+      } catch (error) {
+        console.error("No se pudo eliminar drawing persistido", error);
+      }
+    },
+    [],
+  );
+
+  const clearAllDrawingsForScope = useCallback(async (scope: MarketDrawingsScopeArgs) => {
+    const existingIds = drawingsRef.current.map((drawing) => drawing.id);
+    if (existingIds.length === 0) {
+      return;
+    }
+
+    setDrawings([]);
+    selectedDrawingIdRef.current = null;
+    setSelectedDrawingId(null);
+
+    const deleteTasks = existingIds.map((drawingId) =>
+      invokeMarketDrawingDelete({
+        id: drawingId,
+        marketKind: scope.marketKind,
+        symbol: scope.symbol,
+        timeframe: scope.timeframe,
+      }),
+    );
+
+    const deleteResults = await Promise.allSettled(deleteTasks);
+    const failures = deleteResults.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+      console.error("No se pudieron eliminar todos los drawings persistidos", failures);
+    }
+  }, []);
+
+  const loadDrawingsForScope = useCallback(async (scope: MarketDrawingsScopeArgs) => {
+    const requestId = drawingLoadRequestRef.current + 1;
+    drawingLoadRequestRef.current = requestId;
+
+    try {
+      const rows = await invokeMarketDrawingsList(scope);
+      if (drawingLoadRequestRef.current !== requestId) {
+        return;
+      }
+
+      const nextDrawings: PersistedDrawing[] = [];
+      const createdAtMap = new Map<string, number>();
+      for (const row of rows) {
+        const drawing = drawingFromDto(row);
+        if (drawing) {
+          nextDrawings.push(drawing);
+          createdAtMap.set(row.id, row.createdAtMs);
+        }
+      }
+
+      drawingCreatedAtRef.current = createdAtMap;
+      setDrawings(nextDrawings);
+      selectedDrawingIdRef.current = null;
+      setSelectedDrawingId(null);
+    } catch (error) {
+      console.error("No se pudieron cargar drawings persistidos", error);
+      setDrawings([]);
+    }
+  }, []);
 
   const updateCurrentPriceLine = (price: number): void => {
     const line = currentPriceLineRef.current;
@@ -703,7 +886,7 @@ export const MarketPriceChartIsland = () => {
       return;
     }
 
-    chart.setCrosshairPosition(point.price, point.time, series);
+    chart.setCrosshairPosition(point.price, toUtcTimestamp(point.time), series);
   };
 
   const clearProgrammaticCrosshair = () => {
@@ -717,7 +900,7 @@ export const MarketPriceChartIsland = () => {
       return null;
     }
 
-    const x = chart.timeScale().timeToCoordinate(point.time);
+    const x = chart.timeScale().timeToCoordinate(toUtcTimestamp(point.time));
     const y = series.priceToCoordinate(point.price);
     if (!hasFiniteNumber(x) || !hasFiniteNumber(y)) {
       return null;
@@ -732,6 +915,152 @@ export const MarketPriceChartIsland = () => {
     }
     const y = series.priceToCoordinate(price);
     return hasFiniteNumber(y) ? y : null;
+  };
+
+  const drawingHandlePoints = (drawing: PersistedDrawing): ReadonlyArray<DrawingPoint> => {
+    switch (drawing.type) {
+      case "trendLine":
+      case "ruler":
+      case "fibRetracement":
+        return [drawing.start, drawing.end];
+      case "fibExtension":
+        return [drawing.first, drawing.second, drawing.third];
+      case "horizontalLine":
+        return [];
+      default:
+        return [];
+    }
+  };
+
+  const translateDrawing = (
+    drawing: PersistedDrawing,
+    deltaTimeSeconds: number,
+    deltaPrice: number,
+  ): PersistedDrawing => {
+    const withShift = (point: DrawingPoint): DrawingPoint => ({
+      time: Math.max(1, Math.round(point.time + deltaTimeSeconds)),
+      price: point.price + deltaPrice,
+    });
+
+    switch (drawing.type) {
+      case "trendLine":
+      case "ruler":
+      case "fibRetracement":
+        return {
+          ...drawing,
+          start: withShift(drawing.start),
+          end: withShift(drawing.end),
+        };
+      case "fibExtension":
+        return {
+          ...drawing,
+          first: withShift(drawing.first),
+          second: withShift(drawing.second),
+          third: withShift(drawing.third),
+        };
+      case "horizontalLine":
+        return {
+          ...drawing,
+          price: drawing.price + deltaPrice,
+        };
+      default:
+        return drawing;
+    }
+  };
+
+  const setDrawingHandlePoint = (
+    drawing: PersistedDrawing,
+    handleIndex: number,
+    point: DrawingPoint,
+  ): PersistedDrawing => {
+    switch (drawing.type) {
+      case "trendLine":
+      case "ruler":
+      case "fibRetracement":
+        if (handleIndex === 0) {
+          return { ...drawing, start: point };
+        }
+        if (handleIndex === 1) {
+          return { ...drawing, end: point };
+        }
+        return drawing;
+      case "fibExtension":
+        if (handleIndex === 0) {
+          return { ...drawing, first: point };
+        }
+        if (handleIndex === 1) {
+          return { ...drawing, second: point };
+        }
+        if (handleIndex === 2) {
+          return { ...drawing, third: point };
+        }
+        return drawing;
+      case "horizontalLine":
+        return { ...drawing, price: point.price };
+      default:
+        return drawing;
+    }
+  };
+
+  const findDrawingHit = (target: CanvasPoint, drawingFilterId?: string): DrawingHit | null => {
+    const hitRadius = 8;
+    const candidates = drawingFilterId
+      ? drawingsRef.current.filter((drawing) => drawing.id === drawingFilterId)
+      : drawingsRef.current;
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const drawing = candidates[index];
+      const handles = drawingHandlePoints(drawing);
+      for (const [handleIndex, handle] of handles.entries()) {
+        const handlePoint = canvasPointFromDataPoint(handle);
+        if (!handlePoint) {
+          continue;
+        }
+        if (distance(target, handlePoint) <= hitRadius) {
+          return { drawingId: drawing.id, kind: "handle", handleIndex };
+        }
+      }
+
+      switch (drawing.type) {
+        case "trendLine":
+        case "ruler":
+        case "fibRetracement": {
+          const start = canvasPointFromDataPoint(drawing.start);
+          const end = canvasPointFromDataPoint(drawing.end);
+          if (!start || !end) {
+            break;
+          }
+          if (distanceToSegment(target, start, end) <= hitRadius) {
+            return { drawingId: drawing.id, kind: "body", handleIndex: null };
+          }
+          break;
+        }
+        case "fibExtension": {
+          const first = canvasPointFromDataPoint(drawing.first);
+          const second = canvasPointFromDataPoint(drawing.second);
+          const third = canvasPointFromDataPoint(drawing.third);
+          if (!first || !second || !third) {
+            break;
+          }
+          const baseline = distanceToSegment(target, first, second);
+          const projection = distanceToSegment(target, second, third);
+          if (Math.min(baseline, projection) <= hitRadius) {
+            return { drawingId: drawing.id, kind: "body", handleIndex: null };
+          }
+          break;
+        }
+        case "horizontalLine": {
+          const y = yFromPrice(drawing.price);
+          if (hasFiniteNumber(y) && Math.abs(y - target.y) <= hitRadius) {
+            return { drawingId: drawing.id, kind: "body", handleIndex: null };
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    return null;
   };
 
   const drawOverlay = () => {
@@ -756,39 +1085,62 @@ export const MarketPriceChartIsland = () => {
     context.clearRect(0, 0, overlay.width, overlay.height);
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const drawTrendLine = (start: DrawingPoint, end: DrawingPoint, preview = false) => {
+    const selectedDrawingId = selectedDrawingIdRef.current;
+    const drawTrendLine = (
+      start: DrawingPoint,
+      end: DrawingPoint,
+      color: string,
+      preview = false,
+      selected = false,
+    ) => {
       const startPoint = canvasPointFromDataPoint(start);
       const endPoint = canvasPointFromDataPoint(end);
       if (!startPoint || !endPoint) {
         return;
       }
 
-      drawSegment(context, startPoint, endPoint, preview ? "#38bdf8" : "#0ea5e9", 1.5, false);
-      drawPointHandle(context, startPoint, preview ? "#38bdf8" : "#0ea5e9");
-      drawPointHandle(context, endPoint, preview ? "#38bdf8" : "#0ea5e9");
+      const stroke = preview ? "#38bdf8" : color;
+      drawSegment(context, startPoint, endPoint, stroke, selected ? 2.2 : 1.5, false);
+      drawPointHandle(context, startPoint, selected ? "#f97316" : stroke);
+      drawPointHandle(context, endPoint, selected ? "#f97316" : stroke);
     };
 
-    const drawHorizontalLine = (price: number) => {
+    const drawHorizontalLine = (
+      price: number,
+      color: string,
+      label: string | null,
+      selected = false,
+    ) => {
       const y = yFromPrice(price);
       if (!hasFiniteNumber(y)) {
         return;
       }
 
-      drawSegment(context, { x: 0, y }, { x: width, y }, "#f59e0b", 1.25, false);
+      drawSegment(context, { x: 0, y }, { x: width, y }, color, selected ? 2 : 1.25, false);
       const labelX = Math.max(8, width - 122);
-      drawTextBadge(context, `H ${price.toFixed(2)}`, labelX, y - 4, "#92400e");
+      drawTextBadge(context, `H ${price.toFixed(2)}`, labelX, y - 4, "#111827");
+      if (label) {
+        drawTextBadge(context, label, 8, y - 24, "#1f2937");
+      }
     };
 
-    const drawRuler = (start: DrawingPoint, end: DrawingPoint, preview = false) => {
+    const drawRuler = (
+      start: DrawingPoint,
+      end: DrawingPoint,
+      color: string,
+      preview = false,
+      selected = false,
+    ) => {
       const startPoint = canvasPointFromDataPoint(start);
       const endPoint = canvasPointFromDataPoint(end);
       if (!startPoint || !endPoint) {
         return;
       }
 
-      drawSegment(context, startPoint, endPoint, preview ? "#c084fc" : "#a855f7", 1.3, true);
-      drawPointHandle(context, startPoint, preview ? "#c084fc" : "#a855f7");
-      drawPointHandle(context, endPoint, preview ? "#c084fc" : "#a855f7");
+      const stroke = preview ? "#c084fc" : color;
+      drawSegment(context, startPoint, endPoint, stroke, selected ? 2 : 1.3, true);
+      drawPointHandle(context, startPoint, selected ? "#f97316" : stroke);
+      drawPointHandle(context, endPoint, selected ? "#f97316" : stroke);
 
       const delta = end.price - start.price;
       const percent = start.price === 0 ? 0 : (delta / start.price) * 100;
@@ -802,7 +1154,13 @@ export const MarketPriceChartIsland = () => {
       drawTextBadge(context, label, labelX, midpoint.y - 6, "#581c87");
     };
 
-    const drawFibRetracement = (start: DrawingPoint, end: DrawingPoint, preview = false) => {
+    const drawFibRetracement = (
+      start: DrawingPoint,
+      end: DrawingPoint,
+      color: string,
+      preview = false,
+      selected = false,
+    ) => {
       const startPoint = canvasPointFromDataPoint(start);
       const endPoint = canvasPointFromDataPoint(end);
       if (!startPoint || !endPoint) {
@@ -812,9 +1170,10 @@ export const MarketPriceChartIsland = () => {
       const left = Math.min(startPoint.x, endPoint.x);
       const right = Math.max(startPoint.x, endPoint.x);
       const range = end.price - start.price;
-      drawSegment(context, startPoint, endPoint, preview ? "#facc15" : "#eab308", 1, true);
-      drawPointHandle(context, startPoint, preview ? "#facc15" : "#eab308");
-      drawPointHandle(context, endPoint, preview ? "#facc15" : "#eab308");
+      const stroke = preview ? "#facc15" : color;
+      drawSegment(context, startPoint, endPoint, stroke, selected ? 2 : 1, true);
+      drawPointHandle(context, startPoint, selected ? "#f97316" : stroke);
+      drawPointHandle(context, endPoint, selected ? "#f97316" : stroke);
 
       for (const level of FIB_RETRACEMENT_LEVELS) {
         const levelPrice = start.price + range * level;
@@ -822,8 +1181,7 @@ export const MarketPriceChartIsland = () => {
         if (!hasFiniteNumber(y)) {
           continue;
         }
-        const color = level === 0.5 ? "#ca8a04" : preview ? "#facc15" : "#eab308";
-        drawSegment(context, { x: left, y }, { x: right, y }, color, 1, false);
+        drawSegment(context, { x: left, y }, { x: right, y }, stroke, 1, false);
         const label = `${(level * 100).toFixed(1)}% ${levelPrice.toFixed(2)}`;
         const labelX = clamp(right + 6, 6, Math.max(6, width - 170));
         drawTextBadge(context, label, labelX, y - 3, "#713f12");
@@ -834,7 +1192,9 @@ export const MarketPriceChartIsland = () => {
       first: DrawingPoint,
       second: DrawingPoint,
       third: DrawingPoint,
+      color: string,
       preview = false,
+      selected = false,
     ) => {
       const firstPoint = canvasPointFromDataPoint(first);
       const secondPoint = canvasPointFromDataPoint(second);
@@ -843,12 +1203,12 @@ export const MarketPriceChartIsland = () => {
         return;
       }
 
-      const baselineColor = preview ? "#5eead4" : "#14b8a6";
+      const baselineColor = preview ? "#5eead4" : color;
       drawSegment(context, firstPoint, secondPoint, baselineColor, 1.1, true);
-      drawSegment(context, secondPoint, thirdPoint, baselineColor, 1.1, true);
-      drawPointHandle(context, firstPoint, baselineColor);
-      drawPointHandle(context, secondPoint, baselineColor);
-      drawPointHandle(context, thirdPoint, baselineColor);
+      drawSegment(context, secondPoint, thirdPoint, baselineColor, selected ? 2 : 1.1, true);
+      drawPointHandle(context, firstPoint, selected ? "#f97316" : baselineColor);
+      drawPointHandle(context, secondPoint, selected ? "#f97316" : baselineColor);
+      drawPointHandle(context, thirdPoint, selected ? "#f97316" : baselineColor);
 
       const projection = second.price - first.price;
       const xStart = clamp(thirdPoint.x, 0, width);
@@ -871,24 +1231,45 @@ export const MarketPriceChartIsland = () => {
     };
 
     for (const drawing of drawingsRef.current) {
+      const selected = drawing.id === selectedDrawingId;
       switch (drawing.type) {
         case "trendLine":
-          drawTrendLine(drawing.start, drawing.end);
+          drawTrendLine(drawing.start, drawing.end, drawing.color, false, selected);
           break;
         case "horizontalLine":
-          drawHorizontalLine(drawing.price);
+          drawHorizontalLine(drawing.price, drawing.color, drawing.label, selected);
           break;
         case "ruler":
-          drawRuler(drawing.start, drawing.end);
+          drawRuler(drawing.start, drawing.end, drawing.color, false, selected);
           break;
         case "fibRetracement":
-          drawFibRetracement(drawing.start, drawing.end);
+          drawFibRetracement(drawing.start, drawing.end, drawing.color, false, selected);
           break;
         case "fibExtension":
-          drawFibExtension(drawing.first, drawing.second, drawing.third);
+          drawFibExtension(
+            drawing.first,
+            drawing.second,
+            drawing.third,
+            drawing.color,
+            false,
+            selected,
+          );
           break;
         default:
           break;
+      }
+      if (drawing.label && drawing.type !== "horizontalLine") {
+        const labelAnchor =
+          drawing.type === "fibExtension"
+            ? canvasPointFromDataPoint(drawing.third)
+            : drawing.type === "trendLine" ||
+                drawing.type === "ruler" ||
+                drawing.type === "fibRetracement"
+              ? canvasPointFromDataPoint(drawing.end)
+              : null;
+        if (labelAnchor) {
+          drawTextBadge(context, drawing.label, labelAnchor.x + 8, labelAnchor.y - 4, "#111827");
+        }
       }
     }
 
@@ -900,13 +1281,13 @@ export const MarketPriceChartIsland = () => {
     if (draft.kind === "drag") {
       switch (draft.tool) {
         case "trendLine":
-          drawTrendLine(draft.start, draft.current, true);
+          drawTrendLine(draft.start, draft.current, "#38bdf8", true);
           break;
         case "ruler":
-          drawRuler(draft.start, draft.current, true);
+          drawRuler(draft.start, draft.current, "#c084fc", true);
           break;
         case "fibRetracement":
-          drawFibRetracement(draft.start, draft.current, true);
+          drawFibRetracement(draft.start, draft.current, "#facc15", true);
           break;
         default:
           break;
@@ -927,7 +1308,7 @@ export const MarketPriceChartIsland = () => {
     }
 
     if (draft.points.length === 2 && draft.current) {
-      drawFibExtension(draft.points[0], draft.points[1], draft.current, true);
+      drawFibExtension(draft.points[0], draft.points[1], draft.current, "#5eead4", true);
     }
   };
 
@@ -949,7 +1330,13 @@ export const MarketPriceChartIsland = () => {
     selectedToolRef.current !== "selection";
 
   const appendDrawing = (drawing: PersistedDrawing) => {
-    drawingsRef.current = [...drawingsRef.current, drawing];
+    const scopeAtWrite = activeScope;
+    setDrawings([...drawingsRef.current, drawing]);
+    selectedDrawingIdRef.current = drawing.id;
+    setSelectedDrawingId(drawing.id);
+    void persistDrawing(drawing, scopeAtWrite);
+    selectedToolRef.current = "selection";
+    setSelectedTool("selection");
     requestOverlayRedraw();
   };
 
@@ -984,6 +1371,8 @@ export const MarketPriceChartIsland = () => {
           type: "trendLine",
           start: draft.start,
           end,
+          color: "#0EA5E9",
+          label: null,
         });
         break;
       case "ruler":
@@ -992,6 +1381,8 @@ export const MarketPriceChartIsland = () => {
           type: "ruler",
           start: draft.start,
           end,
+          color: "#A855F7",
+          label: null,
         });
         break;
       case "fibRetracement":
@@ -1000,6 +1391,8 @@ export const MarketPriceChartIsland = () => {
           type: "fibRetracement",
           start: draft.start,
           end,
+          color: "#EAB308",
+          label: null,
         });
         break;
       default:
@@ -1020,6 +1413,39 @@ export const MarketPriceChartIsland = () => {
   const handleOverlayPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const tool = selectedToolRef.current;
     if (tool === "selection") {
+      const selectedId = selectedDrawingIdRef.current;
+      if (!selectedId) {
+        return;
+      }
+
+      const coordinate = getCanvasCoordinatesFromEvent(event);
+      const hit = findDrawingHit(coordinate, selectedId);
+      if (!hit) {
+        selectedDrawingIdRef.current = null;
+        setSelectedDrawingId(null);
+        requestOverlayRedraw();
+        return;
+      }
+
+      const anchor = pointFromCanvasCoordinate(coordinate.x, coordinate.y);
+      if (!anchor) {
+        return;
+      }
+      const snapshot = drawingsRef.current.find((drawing) => drawing.id === selectedId);
+      if (!snapshot) {
+        return;
+      }
+
+      selectedDrawingDragRef.current = {
+        pointerId: event.pointerId,
+        drawingId: selectedId,
+        anchor,
+        snapshot,
+        kind: hit.kind,
+        handleIndex: hit.handleIndex,
+      };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      event.preventDefault();
       return;
     }
 
@@ -1036,6 +1462,8 @@ export const MarketPriceChartIsland = () => {
         id: createDrawingId(),
         type: "horizontalLine",
         price: point.price,
+        color: "#F59E0B",
+        label: null,
       });
       return;
     }
@@ -1068,6 +1496,8 @@ export const MarketPriceChartIsland = () => {
         first: draft.points[0],
         second: draft.points[1],
         third: point,
+        color: "#14B8A6",
+        label: null,
       });
       draftRef.current = null;
       return;
@@ -1089,7 +1519,30 @@ export const MarketPriceChartIsland = () => {
   const handleOverlayPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const tool = selectedToolRef.current;
     if (tool === "selection") {
-      clearProgrammaticCrosshair();
+      const dragState = selectedDrawingDragRef.current;
+      if (!dragState || dragState.pointerId !== event.pointerId) {
+        clearProgrammaticCrosshair();
+        return;
+      }
+
+      const coordinate = getCanvasCoordinatesFromEvent(event);
+      const point = pointFromCanvasCoordinate(coordinate.x, coordinate.y);
+      if (!point) {
+        clearProgrammaticCrosshair();
+        return;
+      }
+
+      const updated =
+        dragState.kind === "handle" && dragState.handleIndex !== null
+          ? setDrawingHandlePoint(dragState.snapshot, dragState.handleIndex, point)
+          : translateDrawing(
+              dragState.snapshot,
+              Number(point.time) - Number(dragState.anchor.time),
+              point.price - dragState.anchor.price,
+            );
+      updateDrawingById(dragState.drawingId, () => updated);
+      syncProgrammaticCrosshair(point);
+      requestOverlayRedraw();
       return;
     }
 
@@ -1126,6 +1579,23 @@ export const MarketPriceChartIsland = () => {
   };
 
   const handleOverlayPointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (selectedToolRef.current === "selection") {
+      const dragState = selectedDrawingDragRef.current;
+      if (!dragState || dragState.pointerId !== event.pointerId) {
+        return;
+      }
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      selectedDrawingDragRef.current = null;
+      const drawing = drawingsRef.current.find((entry) => entry.id === dragState.drawingId);
+      if (drawing) {
+        void persistDrawing(drawing, activeScope);
+      }
+      clearProgrammaticCrosshair();
+      return;
+    }
+
     const draft = draftRef.current;
     if (!draft || draft.kind !== "drag") {
       return;
@@ -1145,6 +1615,19 @@ export const MarketPriceChartIsland = () => {
   };
 
   const handleOverlayPointerCancel = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (selectedToolRef.current === "selection") {
+      const dragState = selectedDrawingDragRef.current;
+      if (!dragState || dragState.pointerId !== event.pointerId) {
+        return;
+      }
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      selectedDrawingDragRef.current = null;
+      clearProgrammaticCrosshair();
+      return;
+    }
+
     const draft = draftRef.current;
     if (!draft || draft.kind !== "drag") {
       return;
@@ -1161,6 +1644,7 @@ export const MarketPriceChartIsland = () => {
 
   const handleOverlayPointerLeave = () => {
     clearProgrammaticCrosshair();
+    selectedDrawingDragRef.current = null;
     if (draftRef.current?.kind !== "drag") {
       return;
     }
@@ -1191,11 +1675,33 @@ export const MarketPriceChartIsland = () => {
 
   useEffect(() => {
     isMagnetStrongRef.current = isMagnetStrong;
+    $marketMagnetStrong.set(isMagnetStrong);
   }, [isMagnetStrong]);
+
+  useEffect(() => {
+    selectedDrawingIdRef.current = selectedDrawingId;
+  }, [selectedDrawingId]);
 
   useEffect(() => {
     timeframeRef.current = timeframe;
   }, [timeframe]);
+
+  useEffect(() => {
+    desiredMarketKindRef.current = marketKind;
+    desiredSymbolRef.current = symbol;
+    desiredTimeframeRef.current = timeframe;
+  }, [marketKind, symbol, timeframe]);
+
+  useEffect(() => {
+    return () => {
+      if (settingsSaveTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(settingsSaveTimerRef.current);
+      }
+      if (drawingStyleSaveTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(drawingStyleSaveTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1214,9 +1720,14 @@ export const MarketPriceChartIsland = () => {
         return;
       }
 
-      if ((event.key === "Delete" || event.key === "Backspace") && drawingsRef.current.length > 0) {
-        drawingsRef.current = drawingsRef.current.slice(0, drawingsRef.current.length - 1);
+      if (event.key === "Delete" || event.key === "Backspace") {
+        const targetDrawingId =
+          selectedDrawingIdRef.current ?? drawingsRef.current[drawingsRef.current.length - 1]?.id;
+        if (!targetDrawingId) {
+          return;
+        }
         requestOverlayRedraw();
+        void deleteDrawingById(targetDrawingId, activeScope);
       }
     };
 
@@ -1225,7 +1736,7 @@ export const MarketPriceChartIsland = () => {
       window.removeEventListener("keydown", onKeyDown);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activeScope, deleteDrawingById]);
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -1316,23 +1827,73 @@ export const MarketPriceChartIsland = () => {
     chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange);
 
     const onCrosshairMove = (param: { point?: { x: number; y: number } | null }) => {
+      const containerElement = chartContainerRef.current;
       if (!isMagnetStrongRef.current) {
+        if (!containerElement || !param.point) {
+          clearMarketSharedCrosshairBySource("price");
+        } else {
+          const bounds = containerElement.getBoundingClientRect();
+          setMarketSharedCrosshair({
+            visible: true,
+            screenX: bounds.left + param.point.x,
+            source: "price",
+          });
+        }
         return;
       }
       if (selectedToolRef.current !== "selection") {
+        if (!containerElement || !param.point) {
+          clearMarketSharedCrosshairBySource("price");
+        } else {
+          const bounds = containerElement.getBoundingClientRect();
+          setMarketSharedCrosshair({
+            visible: true,
+            screenX: bounds.left + param.point.x,
+            source: "price",
+          });
+        }
         return;
       }
       const point = param.point;
       if (!point) {
+        clearMarketSharedCrosshairBySource("price");
         return;
+      }
+      if (containerElement) {
+        const bounds = containerElement.getBoundingClientRect();
+        setMarketSharedCrosshair({
+          visible: true,
+          screenX: bounds.left + point.x,
+          source: "price",
+        });
       }
       const snapped = pointFromCanvasCoordinate(point.x, point.y);
       if (!snapped) {
         return;
       }
-      chart.setCrosshairPosition(snapped.price, snapped.time, candleSeries);
+      chart.setCrosshairPosition(snapped.price, toUtcTimestamp(snapped.time), candleSeries);
     };
     chart.subscribeCrosshairMove(onCrosshairMove);
+
+    const onChartClick = (param: { point?: { x: number; y: number } | null }) => {
+      if (selectedToolRef.current !== "selection") {
+        return;
+      }
+      const point = param.point;
+      if (!point) {
+        selectedDrawingIdRef.current = null;
+        setSelectedDrawingId(null);
+        requestOverlayRedraw();
+        return;
+      }
+
+      const hit = findDrawingHit({ x: point.x, y: point.y });
+      const nextSelectedId = hit?.drawingId ?? null;
+      selectedDrawingIdRef.current = nextSelectedId;
+      setSelectedDrawingId(nextSelectedId);
+      requestOverlayRedraw();
+    };
+    chart.subscribeClick(onChartClick);
 
     const resizeObserver = new ResizeObserver(() => {
       if (!chartContainerRef.current || !chartRef.current) {
@@ -1350,6 +1911,7 @@ export const MarketPriceChartIsland = () => {
 
     return () => {
       chart.unsubscribeCrosshairMove(onCrosshairMove);
+      chart.unsubscribeClick(onChartClick);
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange);
       resizeObserver.disconnect();
       chart.remove();
@@ -1366,6 +1928,7 @@ export const MarketPriceChartIsland = () => {
       hasBootstrapCandlesRef.current = false;
       pendingLiveCandlesRef.current = new Map();
       clearProgrammaticCrosshair();
+      clearMarketSharedCrosshairBySource("price");
       setMarketVisibleLogicalRange(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1379,13 +1942,57 @@ export const MarketPriceChartIsland = () => {
     let disposed = false;
     let unlisten: (() => void) | null = null;
 
-    const startStream = async (nextTimeframe: MarketTimeframe, nextSymbol: string) => {
+    const resolveSymbolsForMarket = async (
+      nextMarketKind: MarketKind,
+      requestedSymbol: string,
+    ): Promise<string> => {
+      setIsSymbolsLoading(true);
+      symbolsLoadingRef.current = true;
+      try {
+        const symbols = await invokeMarketSymbols({ marketKind: nextMarketKind });
+        if (disposed) {
+          return requestedSymbol;
+        }
+
+        if (symbols.length === 0) {
+          setMarketSymbols([requestedSymbol]);
+          return requestedSymbol;
+        }
+
+        setMarketSymbols(symbols);
+        if (symbols.includes(requestedSymbol)) {
+          return requestedSymbol;
+        }
+
+        return symbols.includes(DEFAULT_STREAM_ARGS.symbol)
+          ? DEFAULT_STREAM_ARGS.symbol
+          : symbols[0];
+      } catch (error) {
+        console.error("No se pudo cargar el listado de pares del mercado", error);
+        setMarketSymbols([requestedSymbol]);
+        return requestedSymbol;
+      } finally {
+        setIsSymbolsLoading(false);
+        symbolsLoadingRef.current = false;
+      }
+    };
+
+    const startStream = async (
+      nextMarketKind: MarketKind,
+      nextTimeframe: MarketTimeframe,
+      nextSymbol: string,
+    ) => {
+      desiredMarketKindRef.current = nextMarketKind;
+      desiredTimeframeRef.current = nextTimeframe;
+      desiredSymbolRef.current = nextSymbol;
+      requestedMarketKindRef.current = nextMarketKind;
       requestedTimeframeRef.current = nextTimeframe;
       requestedSymbolRef.current = nextSymbol;
       hasBootstrapCandlesRef.current = false;
       pendingLiveCandlesRef.current = new Map();
       await invokeStartMarketStream({
         ...DEFAULT_STREAM_ARGS,
+        marketKind: nextMarketKind,
         symbol: nextSymbol,
         timeframe: nextTimeframe,
         mockMode: shouldUseDeterministicMock(),
@@ -1394,22 +2001,40 @@ export const MarketPriceChartIsland = () => {
     };
 
     const boot = async () => {
+      let nextMarketKind = marketKind;
       let nextSymbol = symbol;
+      let nextTimeframe = timeframe;
+      let nextMagnetStrong = isMagnetStrong;
+
       try {
-        const symbols = await invokeMarketSpotSymbols();
-        if (symbols.length > 0) {
-          setSpotSymbols(symbols);
-          const fallbackSymbol = symbols.includes(DEFAULT_STREAM_ARGS.symbol)
-            ? DEFAULT_STREAM_ARGS.symbol
-            : symbols[0];
-          nextSymbol = symbols.includes(symbol) ? symbol : fallbackSymbol;
-          if (nextSymbol !== symbol) {
-            $marketSymbol.set(nextSymbol);
-          }
-        }
+        const preferences = await invokeMarketPreferencesGet();
+        nextMarketKind = preferences.marketKind;
+        nextSymbol = preferences.symbol;
+        nextTimeframe = preferences.timeframe;
+        nextMagnetStrong = preferences.magnetStrong;
       } catch (error) {
-        console.error("No se pudo cargar el listado de pares spot", error);
+        console.error("No se pudieron cargar preferencias de mercado", error);
       }
+
+      if (nextMarketKind !== marketKind) {
+        $marketKind.set(nextMarketKind);
+      }
+      if (nextTimeframe !== timeframe) {
+        $marketTimeframe.set(nextTimeframe);
+      }
+      setIsMagnetStrong(nextMagnetStrong);
+
+      nextSymbol = await resolveSymbolsForMarket(nextMarketKind, nextSymbol);
+      if (nextSymbol !== symbol) {
+        $marketSymbol.set(nextSymbol);
+      }
+
+      await loadDrawingsForScope({
+        marketKind: nextMarketKind,
+        symbol: nextSymbol,
+        timeframe: nextTimeframe,
+      });
+      requestOverlayRedraw();
 
       const unlistenEvents = await listenMarketEvents({
         onMarketFrameUpdate: (frame) => {
@@ -1465,6 +2090,13 @@ export const MarketPriceChartIsland = () => {
           requestOverlayRedraw();
         },
         onStatus: (status) => {
+          const isStaleStatus =
+            status.marketKind !== desiredMarketKindRef.current ||
+            status.symbol !== desiredSymbolRef.current ||
+            status.timeframe !== desiredTimeframeRef.current;
+          if (isStaleStatus) {
+            return;
+          }
           applyMarketStatus(status);
         },
         onDeltaCandlesBootstrap: (payload) => {
@@ -1483,7 +2115,8 @@ export const MarketPriceChartIsland = () => {
       unlisten = unlistenEvents;
 
       try {
-        await startStream(timeframe, nextSymbol);
+        await startStream(nextMarketKind, nextTimeframe, nextSymbol);
+        isHydratedRef.current = true;
       } catch (error) {
         console.error("No se pudo iniciar market stream", error);
       }
@@ -1493,6 +2126,12 @@ export const MarketPriceChartIsland = () => {
 
     return () => {
       disposed = true;
+      if (settingsSaveTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(settingsSaveTimerRef.current);
+      }
+      if (drawingStyleSaveTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(drawingStyleSaveTimerRef.current);
+      }
       unlisten?.();
       resetMarketStatus();
       void invokeStopMarketStream().catch((error) => {
@@ -1503,10 +2142,93 @@ export const MarketPriceChartIsland = () => {
   }, []);
 
   useEffect(() => {
+    if (!hasTauriRuntime() || !isHydratedRef.current) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      setIsSymbolsLoading(true);
+      symbolsLoadingRef.current = true;
+      try {
+        const symbols = await invokeMarketSymbols({ marketKind });
+        if (cancelled) {
+          return;
+        }
+        if (symbols.length === 0) {
+          setMarketSymbols([symbol]);
+          return;
+        }
+        setMarketSymbols(symbols);
+        if (!symbols.includes(symbol)) {
+          const fallback = symbols.includes(DEFAULT_STREAM_ARGS.symbol)
+            ? DEFAULT_STREAM_ARGS.symbol
+            : symbols[0];
+          $marketSymbol.set(fallback);
+        }
+      } catch (error) {
+        console.error("No se pudo refrescar listado de pares", error);
+      } finally {
+        setIsSymbolsLoading(false);
+        symbolsLoadingRef.current = false;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [marketKind, symbol]);
+
+  useEffect(() => {
+    if (!hasTauriRuntime() || !isHydratedRef.current) {
+      return;
+    }
+    void loadDrawingsForScope(activeScope).then(() => {
+      requestOverlayRedraw();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScope, loadDrawingsForScope]);
+
+  useEffect(() => {
+    if (!hasTauriRuntime() || !isHydratedRef.current || typeof window === "undefined") {
+      return;
+    }
+
+    if (settingsSaveTimerRef.current !== null) {
+      window.clearTimeout(settingsSaveTimerRef.current);
+    }
+    settingsSaveTimerRef.current = window.setTimeout(() => {
+      settingsSaveTimerRef.current = null;
+      void invokeMarketPreferencesSave({
+        marketKind,
+        symbol,
+        timeframe,
+        magnetStrong: isMagnetStrong,
+      }).catch((error) => {
+        console.error("No se pudieron guardar preferencias de mercado", error);
+      });
+    }, 300);
+
+    return () => {
+      if (settingsSaveTimerRef.current !== null) {
+        window.clearTimeout(settingsSaveTimerRef.current);
+        settingsSaveTimerRef.current = null;
+      }
+    };
+  }, [isMagnetStrong, marketKind, symbol, timeframe]);
+
+  useEffect(() => {
     if (!hasTauriRuntime() || !hasStartedRef.current) {
       return;
     }
-    if (timeframe === requestedTimeframeRef.current && symbol === requestedSymbolRef.current) {
+    if (isSymbolsLoading || symbolsLoadingRef.current) {
+      return;
+    }
+    if (
+      timeframe === requestedTimeframeRef.current &&
+      symbol === requestedSymbolRef.current &&
+      marketKind === requestedMarketKindRef.current
+    ) {
       return;
     }
 
@@ -1520,20 +2242,26 @@ export const MarketPriceChartIsland = () => {
     applyDeltaCandlesBootstrap([]);
     setMarketVisibleLogicalRange(null);
 
+    requestedMarketKindRef.current = marketKind;
+    requestedTimeframeRef.current = timeframe;
+    requestedSymbolRef.current = symbol;
+    desiredMarketKindRef.current = marketKind;
+    desiredTimeframeRef.current = timeframe;
+    desiredSymbolRef.current = symbol;
     void invokeStartMarketStream({
       ...DEFAULT_STREAM_ARGS,
+      marketKind,
       symbol,
       timeframe,
       mockMode: shouldUseDeterministicMock(),
     })
       .then(() => {
-        requestedTimeframeRef.current = timeframe;
-        requestedSymbolRef.current = symbol;
+        hasStartedRef.current = true;
       })
       .catch((error) => {
-        console.error("No se pudo reiniciar market stream por cambio de símbolo/TF", error);
+        console.error("No se pudo reiniciar market stream por cambio de mercado/símbolo/TF", error);
       });
-  }, [symbol, timeframe]);
+  }, [isSymbolsLoading, marketKind, symbol, timeframe]);
 
   return (
     <section className="w-full rounded-md border border-slate-200 bg-white p-0 shadow-sm dark:border-slate-700 dark:bg-slate-900">
@@ -1589,6 +2317,29 @@ export const MarketPriceChartIsland = () => {
 
         <label
           className="flex shrink-0 items-center gap-1 text-xs font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300"
+          htmlFor="market-kind"
+        >
+          Mercado
+          <select
+            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-sm font-medium text-black dark:text-black"
+            id="market-kind"
+            value={marketKind}
+            onChange={(event) => {
+              const nextMarketKind = event.target.value as MarketKind;
+              desiredMarketKindRef.current = nextMarketKind;
+              $marketKind.set(nextMarketKind);
+            }}
+          >
+            {MARKET_KIND_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label
+          className="flex shrink-0 items-center gap-1 text-xs font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300"
           htmlFor="market-symbol"
         >
           Par
@@ -1597,12 +2348,14 @@ export const MarketPriceChartIsland = () => {
             id="market-symbol"
             value={symbol}
             onChange={(event) => {
-              $marketSymbol.set(event.target.value);
+              const nextSymbol = event.target.value;
+              desiredSymbolRef.current = nextSymbol;
+              $marketSymbol.set(nextSymbol);
             }}
           >
-            {spotSymbols.map((spotSymbol) => (
-              <option key={spotSymbol} value={spotSymbol}>
-                {spotSymbol}
+            {marketSymbols.map((marketSymbol) => (
+              <option key={marketSymbol} value={marketSymbol}>
+                {marketSymbol}
               </option>
             ))}
           </select>
@@ -1618,7 +2371,9 @@ export const MarketPriceChartIsland = () => {
             id="market-timeframe"
             value={timeframe}
             onChange={(event) => {
-              $marketTimeframe.set(event.target.value as MarketTimeframe);
+              const nextTimeframe = event.target.value as MarketTimeframe;
+              desiredTimeframeRef.current = nextTimeframe;
+              $marketTimeframe.set(nextTimeframe);
             }}
           >
             {TIMEFRAME_OPTIONS.map((option) => (
@@ -1630,9 +2385,73 @@ export const MarketPriceChartIsland = () => {
         </label>
 
         <span className="shrink-0 font-medium" data-testid="market-stream-symbol">
-          {symbol}
+          {marketKind === "spot" ? "Spot" : "Futures"} | {symbol}
         </span>
         <MarketRuntimeSummary />
+        {drawings.length > 0 ? (
+          <button
+            className="rounded border border-rose-300 bg-rose-50 px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-100"
+            onClick={() => {
+              requestOverlayRedraw();
+              void clearAllDrawingsForScope(activeScope);
+            }}
+            type="button"
+          >
+            Eliminar todo
+          </button>
+        ) : null}
+
+        {selectedDrawing ? (
+          <div className="flex min-w-[280px] items-center gap-2 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700">
+            <span className="font-semibold uppercase tracking-wide">Drawing</span>
+            <input
+              aria-label="Color drawing"
+              className="h-7 w-9 cursor-pointer rounded border border-slate-300 p-0"
+              type="color"
+              value={selectedDrawing.color}
+              onChange={(event) => {
+                const nextColor = event.target.value.toUpperCase();
+                const updated = updateDrawingById(selectedDrawing.id, (drawing) => ({
+                  ...drawing,
+                  color: nextColor,
+                }));
+                if (updated) {
+                  persistSelectedDrawingStyle(updated, activeScope);
+                  requestOverlayRedraw();
+                }
+              }}
+            />
+            <input
+              aria-label="Texto drawing"
+              className="min-w-[120px] flex-1 rounded border border-slate-300 px-2 py-1 text-xs text-slate-900"
+              maxLength={120}
+              placeholder="Texto opcional"
+              value={selectedDrawing.label ?? ""}
+              onChange={(event) => {
+                const raw = event.target.value;
+                const nextLabel = raw.trim().length === 0 ? null : raw.slice(0, 120);
+                const updated = updateDrawingById(selectedDrawing.id, (drawing) => ({
+                  ...drawing,
+                  label: nextLabel,
+                }));
+                if (updated) {
+                  persistSelectedDrawingStyle(updated, activeScope);
+                  requestOverlayRedraw();
+                }
+              }}
+            />
+            <button
+              className="rounded border border-rose-300 bg-rose-50 px-2 py-1 font-semibold text-rose-700 hover:bg-rose-100"
+              onClick={() => {
+                requestOverlayRedraw();
+                void deleteDrawingById(selectedDrawing.id, activeScope);
+              }}
+              type="button"
+            >
+              Eliminar
+            </button>
+          </div>
+        ) : null}
       </div>
 
       <div
@@ -1642,7 +2461,9 @@ export const MarketPriceChartIsland = () => {
         <canvas
           aria-hidden="true"
           className={`absolute inset-0 z-20 h-full w-full touch-none ${
-            selectedTool === "selection" ? "pointer-events-none" : "pointer-events-auto"
+            selectedTool === "selection" && !selectedDrawingId
+              ? "pointer-events-none"
+              : "pointer-events-auto"
           } ${cursorClassByTool[selectedTool]}`}
           data-active-tool={selectedTool}
           data-testid="market-drawing-overlay"

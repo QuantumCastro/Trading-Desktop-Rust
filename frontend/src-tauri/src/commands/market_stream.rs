@@ -1,9 +1,9 @@
 use crate::error::AppError;
-use crate::market::binance::fetch_spot_symbols;
+use crate::market::binance::{fetch_market_symbols, fetch_spot_symbols};
 use crate::market::pipeline::run_market_stream;
 use crate::market::types::{
     MarketConnectionState, MarketStreamSession, MarketStreamStatusSnapshot, MarketStreamStopResult,
-    StartMarketStreamArgs,
+    MarketSymbolsArgs, StartMarketStreamArgs,
 };
 use crate::state::{AppState, MarketStreamHandle};
 use reqwest::Client;
@@ -67,13 +67,18 @@ pub async fn stop_market_stream(
     };
 
     {
-        let (current_symbol, current_timeframe) = {
+        let (current_market_kind, current_symbol, current_timeframe) = {
             let readable = state.market_status.read().await;
-            (readable.symbol.clone(), readable.timeframe)
+            (
+                readable.market_kind,
+                readable.symbol.clone(),
+                readable.timeframe,
+            )
         };
         let mut writable = state.market_status.write().await;
         *writable = MarketStreamStatusSnapshot {
             state: MarketConnectionState::Stopped,
+            market_kind: current_market_kind,
             symbol: current_symbol,
             timeframe: current_timeframe,
             last_agg_id: None,
@@ -95,6 +100,12 @@ pub async fn market_stream_status(
 ) -> Result<MarketStreamStatusSnapshot, AppError> {
     let snapshot = state.market_status.read().await.clone();
     Ok(snapshot)
+}
+
+#[tauri::command]
+pub async fn market_symbols(args: MarketSymbolsArgs) -> Result<Vec<String>, AppError> {
+    let client = Client::new();
+    fetch_market_symbols(&client, args.market_kind).await
 }
 
 #[tauri::command]

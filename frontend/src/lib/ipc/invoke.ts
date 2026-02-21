@@ -3,20 +3,38 @@ import type { ZodType } from "zod";
 import {
   appInfoResponseSchema,
   healthResponseSchema,
+  marketDrawingDeleteArgsSchema,
+  marketDrawingDeleteResultSchema,
+  marketDrawingUpsertArgsSchema,
+  marketDrawingDtoSchema,
+  marketDrawingsScopeArgsSchema,
   marketSpotSymbolsSchema,
   marketStatusSchema,
   marketStreamSessionSchema,
   marketStreamStopResultSchema,
+  marketSymbolsArgsSchema,
+  marketSymbolsSchema,
+  marketPreferencesSnapshotSchema,
+  saveMarketPreferencesArgsSchema,
   startMarketStreamArgsSchema,
   type AppInfoResponse,
   type HealthResponse,
   type IpcArgsMap,
   type IpcCommandName,
   type IpcResponseMap,
+  type MarketDrawingDeleteArgs,
+  type MarketDrawingDeleteResult,
+  type MarketDrawingDto,
+  type MarketDrawingUpsertArgs,
+  type MarketDrawingsScopeArgs,
+  type MarketPreferencesSnapshot,
   type MarketStatus,
   type MarketSpotSymbols,
   type MarketStreamSession,
   type MarketStreamStopResult,
+  type MarketSymbols,
+  type MarketSymbolsArgs,
+  type SaveMarketPreferencesArgs,
   type StartMarketStreamArgs,
 } from "./contracts";
 
@@ -60,7 +78,13 @@ const schemasByCommand: Record<IpcCommandName, ZodType<IpcResponseMap[IpcCommand
   start_market_stream: marketStreamSessionSchema,
   stop_market_stream: marketStreamStopResultSchema,
   market_stream_status: marketStatusSchema,
+  market_symbols: marketSymbolsSchema,
   market_spot_symbols: marketSpotSymbolsSchema,
+  market_preferences_get: marketPreferencesSnapshotSchema,
+  market_preferences_save: marketPreferencesSnapshotSchema,
+  market_drawings_list: marketDrawingDtoSchema.array(),
+  market_drawing_upsert: marketDrawingDtoSchema,
+  market_drawing_delete: marketDrawingDeleteResultSchema,
 };
 
 export const invokeIpc = async <K extends IpcCommandName>(
@@ -88,5 +112,41 @@ export const invokeStopMarketStream = async (): Promise<MarketStreamStopResult> 
 export const invokeMarketStreamStatus = async (): Promise<MarketStatus> =>
   invokeIpc("market_stream_status", undefined);
 
+export const invokeMarketSymbols = async (args: MarketSymbolsArgs): Promise<MarketSymbols> => {
+  const parsedArgs = marketSymbolsArgsSchema.parse(args);
+  return invokeIpc("market_symbols", parsedArgs);
+};
+
 export const invokeMarketSpotSymbols = async (): Promise<MarketSpotSymbols> =>
   invokeIpc("market_spot_symbols", undefined);
+
+export const invokeMarketPreferencesGet = async (): Promise<MarketPreferencesSnapshot> =>
+  invokeIpc("market_preferences_get", undefined);
+
+export const invokeMarketPreferencesSave = async (
+  args: SaveMarketPreferencesArgs,
+): Promise<MarketPreferencesSnapshot> => {
+  const parsedArgs = saveMarketPreferencesArgsSchema.parse(args);
+  return invokeIpc("market_preferences_save", parsedArgs);
+};
+
+export const invokeMarketDrawingsList = async (
+  args: MarketDrawingsScopeArgs,
+): Promise<MarketDrawingDto[]> => {
+  const parsedArgs = marketDrawingsScopeArgsSchema.parse(args);
+  return invokeIpc("market_drawings_list", parsedArgs);
+};
+
+export const invokeMarketDrawingUpsert = async (
+  args: MarketDrawingUpsertArgs,
+): Promise<MarketDrawingDto> => {
+  const parsedArgs = marketDrawingUpsertArgsSchema.parse(args);
+  return invokeIpc("market_drawing_upsert", parsedArgs);
+};
+
+export const invokeMarketDrawingDelete = async (
+  args: MarketDrawingDeleteArgs,
+): Promise<MarketDrawingDeleteResult> => {
+  const parsedArgs = marketDrawingDeleteArgsSchema.parse(args);
+  return invokeIpc("market_drawing_delete", parsedArgs);
+};

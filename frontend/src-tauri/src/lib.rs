@@ -7,8 +7,13 @@ mod state;
 use commands::{
     app_info::app_info,
     health::health,
+    market_preferences::{
+        market_drawing_delete, market_drawing_upsert, market_drawings_list, market_preferences_get,
+        market_preferences_save,
+    },
     market_stream::{
-        market_spot_symbols, market_stream_status, start_market_stream, stop_market_stream,
+        market_spot_symbols, market_stream_status, market_symbols, start_market_stream,
+        stop_market_stream,
     },
 };
 use db::initialize_pool;
@@ -31,7 +36,13 @@ pub fn run() {
             start_market_stream,
             stop_market_stream,
             market_stream_status,
-            market_spot_symbols
+            market_symbols,
+            market_spot_symbols,
+            market_preferences_get,
+            market_preferences_save,
+            market_drawings_list,
+            market_drawing_upsert,
+            market_drawing_delete
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

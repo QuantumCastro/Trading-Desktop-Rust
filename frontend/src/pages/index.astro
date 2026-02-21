@@ -2,11 +2,13 @@
 import BaseLayout from "../layouts/BaseLayout.astro";
 import MarketPriceChartIsland from "../components/MarketPriceChartIsland";
 import MarketDeltaChartIsland from "../components/MarketDeltaChartIsland";
+import MarketSharedCrosshairOverlayIsland from "../components/MarketSharedCrosshairOverlayIsland";
 ---
 
 <BaseLayout>
-  <main class="flex min-h-[60vh] w-full flex-col gap-1 px-0 py-0">
+  <main class="relative flex min-h-[60vh] w-full flex-col gap-1 px-0 py-0" data-market-charts-root>
     <MarketPriceChartIsland client:only="react" />
     <MarketDeltaChartIsland client:only="react" />
+    <MarketSharedCrosshairOverlayIsland client:only="react" />
   </main>
 </BaseLayout>

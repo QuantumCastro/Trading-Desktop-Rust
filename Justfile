@@ -60,14 +60,14 @@ rust-test:
 rust-check:
   cargo check --manifest-path frontend/src-tauri/Cargo.toml
 
-rust-verify:
+backend-verify:
   just rust-lint
   just rust-test
   just rust-check
 
 verify:
   just frontend-verify
-  just rust-verify
+  just backend-verify
 
 gh url:
   Remove-Item -Recurse -Force .git

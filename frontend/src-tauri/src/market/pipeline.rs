@@ -4,7 +4,7 @@ use crate::market::binance::{
     fetch_latest_agg_trade_snapshot, fetch_server_time_ms,
 };
 use crate::market::types::{
-    parse_agg_trade_payload, AggTradeEvent, MarketConnectionState, MarketPerfSnapshot,
+    parse_agg_trade_payload, AggTradeEvent, MarketConnectionState, MarketKind, MarketPerfSnapshot,
     MarketStartupMode, MarketStreamConfig, MarketStreamStatusSnapshot, MarketTimeframe, UiCandle,
     UiCandlesBootstrap, UiDeltaCandle, UiDeltaCandlesBootstrap, UiMarketFrameUpdate, UiTick,
 };
@@ -541,6 +541,7 @@ pub async fn run_market_stream(
         None => {
             let snapshot = MarketStreamStatusSnapshot {
                 state: MarketConnectionState::Error,
+                market_kind: config.market_kind,
                 symbol: config.symbol,
                 timeframe: config.timeframe,
                 last_agg_id: None,
@@ -570,6 +571,7 @@ pub async fn run_market_stream(
                 &window,
                 &telemetry,
                 MarketConnectionState::Connecting,
+                config.market_kind,
                 &config.symbol,
                 config.timeframe,
                 Some("loading historical candles".to_string()),
@@ -592,6 +594,7 @@ pub async fn run_market_stream(
                     &window,
                     &telemetry,
                     MarketConnectionState::Error,
+                    config.market_kind,
                     &config.symbol,
                     config.timeframe,
                     Some(format!("failed to load historical candles: {error}")),
@@ -607,6 +610,7 @@ pub async fn run_market_stream(
                 &window,
                 &telemetry,
                 MarketConnectionState::Connecting,
+                config.market_kind,
                 &config.symbol,
                 config.timeframe,
                 Some("opening websocket stream while history loads".to_string()),
@@ -646,6 +650,7 @@ pub async fn run_market_stream(
                         &history_window,
                         &history_telemetry,
                         current_state,
+                        history_config.market_kind,
                         &history_config.symbol,
                         history_config.timeframe,
                         Some(format!("historical candles unavailable: {error}")),
@@ -662,6 +667,7 @@ pub async fn run_market_stream(
     let consumer_telemetry = Arc::clone(&telemetry);
     let consumer_perf_telemetry = Arc::clone(&perf_telemetry);
     let consumer_window = window.clone();
+    let consumer_market_kind = config.market_kind;
     let consumer_symbol = config.symbol.clone();
     let consumer_interval_ms = config.emit_interval_ms;
     let consumer_emit_legacy_price_event = config.emit_legacy_price_event;
@@ -702,6 +708,7 @@ pub async fn run_market_stream(
                             &consumer_window,
                             &consumer_telemetry,
                             MarketConnectionState::Error,
+                            consumer_market_kind,
                             &consumer_symbol,
                             consumer_timeframe,
                             Some(format!("failed to emit market_frame_update: {error}")),
@@ -717,6 +724,7 @@ pub async fn run_market_stream(
                                     &consumer_window,
                                     &consumer_telemetry,
                                     MarketConnectionState::Error,
+                                    consumer_market_kind,
                                     &consumer_symbol,
                                     consumer_timeframe,
                                     Some(format!("failed to emit price_update: {error}")),
@@ -733,6 +741,7 @@ pub async fn run_market_stream(
                                     &consumer_window,
                                     &consumer_telemetry,
                                     MarketConnectionState::Error,
+                                    consumer_market_kind,
                                     &consumer_symbol,
                                     consumer_timeframe,
                                     Some(format!("failed to emit candle_update: {error}")),
@@ -747,6 +756,7 @@ pub async fn run_market_stream(
                                     &consumer_window,
                                     &consumer_telemetry,
                                     MarketConnectionState::Error,
+                                    consumer_market_kind,
                                     &consumer_symbol,
                                     consumer_timeframe,
                                     Some(format!("failed to emit delta_candle_update: {error}")),
@@ -764,6 +774,7 @@ pub async fn run_market_stream(
     let heartbeat_telemetry = Arc::clone(&telemetry);
     let heartbeat_perf_telemetry = Arc::clone(&perf_telemetry);
     let heartbeat_window = window.clone();
+    let heartbeat_market_kind = config.market_kind;
     let heartbeat_symbol = config.symbol.clone();
     let heartbeat_timeframe = config.timeframe;
     let heartbeat_perf_enabled = config.perf_telemetry;
@@ -784,6 +795,7 @@ pub async fn run_market_stream(
                         &heartbeat_window,
                         &heartbeat_telemetry,
                         current_state,
+                        heartbeat_market_kind,
                         &heartbeat_symbol,
                         heartbeat_timeframe,
                         current_reason,
@@ -807,6 +819,7 @@ pub async fn run_market_stream(
     let clock_telemetry = Arc::clone(&telemetry);
     let clock_http_client = http_client.clone();
     let clock_sync_base_interval_ms = config.clock_sync_interval_ms;
+    let clock_market_kind = config.market_kind;
     let clock_handle = tauri::async_runtime::spawn(async move {
         let mut next_delay_ms = 0_u64;
         let mut ewma = ClockSyncEwma::default();
@@ -815,7 +828,7 @@ pub async fn run_market_stream(
             tokio::select! {
                 _ = clock_cancel.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(next_delay_ms)) => {
-                    match fetch_clock_offset_ms(&clock_http_client).await {
+                    match fetch_clock_offset_ms(&clock_http_client, clock_market_kind).await {
                         Ok(probe) => {
                             let smoothed_offset = ewma.update(probe.offset_ms, probe.rtt_ms);
                             clock_telemetry.set_clock_offset_ms(smoothed_offset);
@@ -859,6 +872,7 @@ pub async fn run_market_stream(
             &window,
             &telemetry,
             MarketConnectionState::Stopped,
+            config.market_kind,
             &config.symbol,
             config.timeframe,
             Some("mock stream stopped".to_string()),
@@ -897,13 +911,14 @@ pub async fn run_market_stream(
             &window,
             &telemetry,
             phase,
+            config.market_kind,
             &config.symbol,
             config.timeframe,
             reason,
         )
         .await;
 
-        match connect_agg_trade_stream(&config.symbol).await {
+        match connect_agg_trade_stream(config.market_kind, &config.symbol).await {
             Ok(mut websocket_stream) => {
                 reconnect_attempt = 0;
                 publish_status(
@@ -911,6 +926,7 @@ pub async fn run_market_stream(
                     &window,
                     &telemetry,
                     MarketConnectionState::Live,
+                    config.market_kind,
                     &config.symbol,
                     config.timeframe,
                     Some("websocket connected".to_string()),
@@ -994,6 +1010,7 @@ pub async fn run_market_stream(
         &window,
         &telemetry,
         MarketConnectionState::Stopped,
+        config.market_kind,
         &config.symbol,
         config.timeframe,
         Some("stream stopped".to_string()),
@@ -1022,12 +1039,14 @@ async fn load_and_emit_history(
     } else {
         let candles_future = fetch_klines_history(
             http_client,
+            config.market_kind,
             &config.symbol,
             config.timeframe,
             config.history_limit,
         );
         let delta_future = fetch_klines_delta_history(
             http_client,
+            config.market_kind,
             &config.symbol,
             config.timeframe,
             config.history_limit,
@@ -1042,6 +1061,7 @@ async fn load_and_emit_history(
                     window,
                     telemetry,
                     MarketConnectionState::Connecting,
+                    config.market_kind,
                     &config.symbol,
                     config.timeframe,
                     Some(format!("delta history unavailable: {error}")),
@@ -1082,6 +1102,7 @@ async fn load_and_emit_history(
         window,
         telemetry,
         current_operational_state(status_store).await,
+        config.market_kind,
         &config.symbol,
         config.timeframe,
         Some("historical candles loaded".to_string()),
@@ -1177,6 +1198,7 @@ async fn run_mock_producer(
         window,
         telemetry,
         MarketConnectionState::Connecting,
+        config.market_kind,
         &config.symbol,
         config.timeframe,
         Some("starting deterministic mock stream".to_string()),
@@ -1188,6 +1210,7 @@ async fn run_mock_producer(
         window,
         telemetry,
         MarketConnectionState::Live,
+        config.market_kind,
         &config.symbol,
         config.timeframe,
         Some("mock mode active".to_string()),
@@ -1318,6 +1341,7 @@ async fn handle_message(message: Message, context: &StreamRuntimeContext<'_>) ->
                 context.window,
                 context.telemetry,
                 MarketConnectionState::Desynced,
+                context.config.market_kind,
                 &context.config.symbol,
                 context.config.timeframe,
                 Some(format!(
@@ -1345,13 +1369,20 @@ async fn resync_with_snapshot(context: &StreamRuntimeContext<'_>) -> bool {
             context.window,
             context.telemetry,
             MarketConnectionState::Reconnecting,
+            context.config.market_kind,
             &context.config.symbol,
             context.config.timeframe,
             Some(format!("starting snapshot resync attempt {}", attempt + 1)),
         )
         .await;
 
-        match fetch_latest_agg_trade_snapshot(context.http_client, &context.config.symbol).await {
+        match fetch_latest_agg_trade_snapshot(
+            context.http_client,
+            context.config.market_kind,
+            &context.config.symbol,
+        )
+        .await
+        {
             Ok(snapshot) => {
                 {
                     let mut writable = context.shared_market_state.lock();
@@ -1366,6 +1397,7 @@ async fn resync_with_snapshot(context: &StreamRuntimeContext<'_>) -> bool {
                     context.window,
                     context.telemetry,
                     MarketConnectionState::Live,
+                    context.config.market_kind,
                     &context.config.symbol,
                     context.config.timeframe,
                     Some("snapshot resync completed".to_string()),
@@ -1394,11 +1426,13 @@ async fn resync_with_snapshot(context: &StreamRuntimeContext<'_>) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_status(
     status_store: &Arc<RwLock<MarketStreamStatusSnapshot>>,
     window: &WebviewWindow,
     telemetry: &Arc<MarketTelemetryAtomics>,
     state: MarketConnectionState,
+    market_kind: MarketKind,
     symbol: &str,
     timeframe: MarketTimeframe,
     reason: Option<String>,
@@ -1406,6 +1440,7 @@ async fn publish_status(
     let telemetry_snapshot = telemetry.snapshot();
     let snapshot = MarketStreamStatusSnapshot {
         state,
+        market_kind,
         symbol: symbol.to_string(),
         timeframe,
         last_agg_id: telemetry_snapshot.last_agg_id,
@@ -1472,6 +1507,7 @@ async fn publish_status_throttled(
         context.window,
         context.telemetry,
         state,
+        context.config.market_kind,
         &context.config.symbol,
         context.config.timeframe,
         reason,
@@ -1479,7 +1515,10 @@ async fn publish_status_throttled(
     .await;
 }
 
-async fn fetch_clock_offset_ms(client: &Client) -> Result<ClockOffsetProbe, AppError> {
+async fn fetch_clock_offset_ms(
+    client: &Client,
+    market_kind: MarketKind,
+) -> Result<ClockOffsetProbe, AppError> {
     let mut probes: Vec<ClockOffsetProbe> = Vec::with_capacity(CLOCK_SYNC_PROBE_COUNT);
 
     for probe_index in 0..CLOCK_SYNC_PROBE_COUNT {
@@ -1487,7 +1526,7 @@ async fn fetch_clock_offset_ms(client: &Client) -> Result<ClockOffsetProbe, AppE
             tokio::time::sleep(Duration::from_millis(CLOCK_SYNC_PROBE_SPACING_MS)).await;
         }
 
-        if let Ok(probe) = fetch_clock_offset_probe(client).await {
+        if let Ok(probe) = fetch_clock_offset_probe(client, market_kind).await {
             if (0..=CLOCK_SYNC_MAX_VALID_RTT_MS).contains(&probe.rtt_ms) {
                 probes.push(probe);
             }
@@ -1520,9 +1559,12 @@ async fn fetch_clock_offset_ms(client: &Client) -> Result<ClockOffsetProbe, AppE
     })
 }
 
-async fn fetch_clock_offset_probe(client: &Client) -> Result<ClockOffsetProbe, AppError> {
+async fn fetch_clock_offset_probe(
+    client: &Client,
+    market_kind: MarketKind,
+) -> Result<ClockOffsetProbe, AppError> {
     let request_started_ms = now_unix_ms();
-    let server_time_ms = fetch_server_time_ms(client).await?;
+    let server_time_ms = fetch_server_time_ms(client, market_kind).await?;
     let request_finished_ms = now_unix_ms();
 
     let rtt_ms = signed_time_delta_ms(request_finished_ms, request_started_ms).max(0);

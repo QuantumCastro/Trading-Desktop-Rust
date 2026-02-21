@@ -60,6 +60,7 @@ describe("market events", () => {
   it("parses valid market status payload", () => {
     const parsed = parseMarketStatusPayload({
       state: "reconnecting",
+      marketKind: "spot",
       symbol: "BTCUSDT",
       timeframe: "1m",
       lastAggId: null,
@@ -249,6 +250,7 @@ describe("market events", () => {
     statusHandler?.({
       payload: {
         state: "live",
+        marketKind: "spot",
         symbol: "BTCUSDT",
         timeframe: "1m",
         lastAggId: 123,

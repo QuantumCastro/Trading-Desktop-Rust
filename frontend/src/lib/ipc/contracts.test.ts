@@ -35,6 +35,7 @@ describe("ipc contracts", () => {
   it("accepts a valid market status payload", () => {
     const parsed = marketStatusSchema.parse({
       state: "live",
+      marketKind: "spot",
       symbol: "BTCUSDT",
       timeframe: "1m",
       lastAggId: 123,

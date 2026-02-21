@@ -1,15 +1,32 @@
 import { atom } from "nanostores";
 import type {
   MarketConnectionState,
+  MarketKind,
   MarketPerfSnapshot,
   MarketStatus,
   MarketTimeframe,
   UiDeltaCandle,
 } from "@lib/ipc/contracts";
+import type { PersistedDrawing } from "@lib/market/drawings";
+
+export type SharedCrosshairState = {
+  visible: boolean;
+  screenX: number | null;
+  source: "price" | "delta" | null;
+};
 
 export const $marketConnectionState = atom<MarketConnectionState>("stopped");
+export const $marketKind = atom<MarketKind>("spot");
 export const $marketSymbol = atom<string>("BTCUSDT");
 export const $marketTimeframe = atom<MarketTimeframe>("1m");
+export const $marketMagnetStrong = atom<boolean>(false);
+export const $marketDrawings = atom<ReadonlyArray<PersistedDrawing>>([]);
+export const $marketSharedCrosshair = atom<SharedCrosshairState>({
+  visible: false,
+  screenX: null,
+  source: null,
+});
+
 export const $marketLatencyMs = atom<number | null>(null);
 export const $marketRawExchangeLatencyMs = atom<number | null>(null);
 export const $marketClockOffsetMs = atom<number | null>(null);
@@ -26,6 +43,7 @@ let marketDeltaLiveSeq = 0;
 
 export const applyMarketStatus = (status: MarketStatus): void => {
   $marketConnectionState.set(status.state);
+  $marketKind.set(status.marketKind);
   $marketSymbol.set(status.symbol);
   $marketTimeframe.set(status.timeframe);
   $marketLatencyMs.set(status.latencyMs);
@@ -47,8 +65,16 @@ export const setMarketFrontendRenderLatency = (latencyMs: number | null): void =
 
 export const resetMarketStatus = (): void => {
   $marketConnectionState.set("stopped");
+  $marketKind.set("spot");
   $marketSymbol.set("BTCUSDT");
   $marketTimeframe.set("1m");
+  $marketMagnetStrong.set(false);
+  $marketDrawings.set([]);
+  $marketSharedCrosshair.set({
+    visible: false,
+    screenX: null,
+    source: null,
+  });
   $marketLatencyMs.set(null);
   $marketRawExchangeLatencyMs.set(null);
   $marketClockOffsetMs.set(null);
@@ -78,4 +104,21 @@ export const upsertDeltaCandle = (candle: UiDeltaCandle): void => {
 
 export const setMarketVisibleLogicalRange = (range: { from: number; to: number } | null): void => {
   $marketVisibleLogicalRange.set(range);
+};
+
+export const setMarketSharedCrosshair = (state: SharedCrosshairState): void => {
+  $marketSharedCrosshair.set(state);
+};
+
+export const clearMarketSharedCrosshairBySource = (source: "price" | "delta"): void => {
+  const current = $marketSharedCrosshair.get();
+  if (current.source !== source) {
+    return;
+  }
+
+  $marketSharedCrosshair.set({
+    visible: false,
+    screenX: null,
+    source: null,
+  });
 };

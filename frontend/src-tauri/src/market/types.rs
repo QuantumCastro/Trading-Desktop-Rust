@@ -9,6 +9,7 @@ pub const DEFAULT_EMIT_LEGACY_PRICE_EVENT: bool = false;
 pub const DEFAULT_EMIT_LEGACY_FRAME_EVENTS: bool = false;
 pub const DEFAULT_PERF_TELEMETRY: bool = false;
 pub const DEFAULT_CLOCK_SYNC_INTERVAL_MS: u64 = 30_000;
+pub const DEFAULT_MARKET_KIND: MarketKind = MarketKind::Spot;
 pub const DEFAULT_TIMEFRAME: MarketTimeframe = MarketTimeframe::M1;
 pub const DEFAULT_STARTUP_MODE: MarketStartupMode = MarketStartupMode::LiveFirst;
 pub const DEFAULT_HISTORY_LIMIT: u16 = 5_000;
@@ -18,6 +19,42 @@ pub const MIN_CLOCK_SYNC_INTERVAL_MS: u64 = 5_000;
 pub const MAX_CLOCK_SYNC_INTERVAL_MS: u64 = 300_000;
 pub const MIN_HISTORY_LIMIT: u16 = 50;
 pub const MAX_HISTORY_LIMIT: u16 = 10_000;
+pub const MAX_DRAWING_LABEL_LEN: usize = 120;
+
+const SUPPORTED_DRAWING_TYPES: [&str; 5] = [
+    "trendLine",
+    "horizontalLine",
+    "ruler",
+    "fibRetracement",
+    "fibExtension",
+];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketKind {
+    #[default]
+    Spot,
+    FuturesUsdm,
+}
+
+impl MarketKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::FuturesUsdm => "futures_usdm",
+        }
+    }
+
+    pub fn parse_str(value: &str) -> Result<Self, AppError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "spot" => Ok(Self::Spot),
+            "futures_usdm" => Ok(Self::FuturesUsdm),
+            _ => Err(AppError::InvalidArgument(format!(
+                "unsupported market kind '{value}'"
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +98,21 @@ impl MarketTimeframe {
         }
     }
 
+    pub fn parse_str(value: &str) -> Result<Self, AppError> {
+        match value.trim() {
+            "1m" => Ok(Self::M1),
+            "5m" => Ok(Self::M5),
+            "1h" => Ok(Self::H1),
+            "4h" => Ok(Self::H4),
+            "1d" => Ok(Self::D1),
+            "1w" => Ok(Self::W1),
+            "1M" => Ok(Self::Mo1),
+            _ => Err(AppError::InvalidArgument(format!(
+                "unsupported timeframe '{value}'"
+            ))),
+        }
+    }
+
     pub fn duration_ms(self) -> i64 {
         match self {
             Self::M1 => 60_000,
@@ -85,6 +137,7 @@ pub enum MarketStartupMode {
 #[serde(rename_all = "camelCase")]
 pub struct MarketStreamStatusSnapshot {
     pub state: MarketConnectionState,
+    pub market_kind: MarketKind,
     pub symbol: String,
     pub timeframe: MarketTimeframe,
     pub last_agg_id: Option<u64>,
@@ -100,6 +153,7 @@ impl MarketStreamStatusSnapshot {
     pub fn stopped(symbol: String, reason: Option<String>) -> Self {
         Self {
             state: MarketConnectionState::Stopped,
+            market_kind: DEFAULT_MARKET_KIND,
             symbol,
             timeframe: DEFAULT_TIMEFRAME,
             last_agg_id: None,
@@ -116,6 +170,7 @@ impl MarketStreamStatusSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StartMarketStreamArgs {
+    pub market_kind: Option<MarketKind>,
     pub symbol: Option<String>,
     pub min_notional_usdt: Option<f64>,
     pub emit_interval_ms: Option<u64>,
@@ -131,6 +186,7 @@ pub struct StartMarketStreamArgs {
 
 #[derive(Debug, Clone)]
 pub struct MarketStreamConfig {
+    pub market_kind: MarketKind,
     pub symbol: String,
     pub min_notional_usdt: f64,
     pub emit_interval_ms: u64,
@@ -144,19 +200,67 @@ pub struct MarketStreamConfig {
     pub history_limit: u16,
 }
 
+fn normalize_symbol(symbol: String) -> Result<String, AppError> {
+    let normalized = symbol.trim().to_ascii_uppercase();
+    if normalized.is_empty() || !normalized.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return Err(AppError::InvalidArgument(
+            "symbol must be non-empty alphanumeric ASCII".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_color(color: String) -> Result<String, AppError> {
+    let normalized = color.trim().to_ascii_uppercase();
+    if normalized.len() != 7 || !normalized.starts_with('#') {
+        return Err(AppError::InvalidArgument(
+            "drawing color must be #RRGGBB".to_string(),
+        ));
+    }
+
+    let is_hex = normalized.chars().skip(1).all(|ch| ch.is_ascii_hexdigit());
+    if !is_hex {
+        return Err(AppError::InvalidArgument(
+            "drawing color must be #RRGGBB".to_string(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_optional_label(value: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(label) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.chars().count() > MAX_DRAWING_LABEL_LEN {
+        return Err(AppError::InvalidArgument(format!(
+            "drawing label exceeds max length ({MAX_DRAWING_LABEL_LEN})"
+        )));
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+fn validate_drawing_type(value: &str) -> Result<(), AppError> {
+    if SUPPORTED_DRAWING_TYPES.contains(&value) {
+        return Ok(());
+    }
+
+    Err(AppError::InvalidArgument(format!(
+        "unsupported drawing_type '{value}'"
+    )))
+}
+
 impl StartMarketStreamArgs {
     pub fn normalize(self) -> Result<MarketStreamConfig, AppError> {
-        let symbol = self
-            .symbol
-            .unwrap_or_else(|| DEFAULT_SYMBOL.to_string())
-            .trim()
-            .to_ascii_uppercase();
-
-        if symbol.is_empty() || !symbol.chars().all(|ch| ch.is_ascii_alphanumeric()) {
-            return Err(AppError::InvalidArgument(
-                "symbol must be non-empty alphanumeric ASCII".to_string(),
-            ));
-        }
+        let market_kind = self.market_kind.unwrap_or(DEFAULT_MARKET_KIND);
+        let symbol = normalize_symbol(self.symbol.unwrap_or_else(|| DEFAULT_SYMBOL.to_string()))?;
 
         let min_notional_usdt = self.min_notional_usdt.unwrap_or(DEFAULT_MIN_NOTIONAL_USDT);
         if !min_notional_usdt.is_finite() || min_notional_usdt < 0.0 {
@@ -200,6 +304,7 @@ impl StartMarketStreamArgs {
         }
 
         Ok(MarketStreamConfig {
+            market_kind,
             symbol,
             min_notional_usdt,
             emit_interval_ms,
@@ -219,6 +324,7 @@ impl StartMarketStreamArgs {
 #[serde(rename_all = "camelCase")]
 pub struct MarketStreamSession {
     pub running: bool,
+    pub market_kind: MarketKind,
     pub symbol: String,
     pub min_notional_usdt: f64,
     pub emit_interval_ms: u64,
@@ -236,6 +342,7 @@ impl MarketStreamSession {
     pub fn from_config(config: &MarketStreamConfig) -> Self {
         Self {
             running: true,
+            market_kind: config.market_kind,
             symbol: config.symbol.clone(),
             min_notional_usdt: config.min_notional_usdt,
             emit_interval_ms: config.emit_interval_ms,
@@ -255,6 +362,155 @@ impl MarketStreamSession {
 #[serde(rename_all = "camelCase")]
 pub struct MarketStreamStopResult {
     pub stopped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketSymbolsArgs {
+    pub market_kind: MarketKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketPreferencesSnapshot {
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+    pub magnet_strong: bool,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveMarketPreferencesArgs {
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+    pub magnet_strong: bool,
+}
+
+impl SaveMarketPreferencesArgs {
+    pub fn normalize(self) -> Result<Self, AppError> {
+        Ok(Self {
+            market_kind: self.market_kind,
+            symbol: normalize_symbol(self.symbol)?,
+            timeframe: self.timeframe,
+            magnet_strong: self.magnet_strong,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDrawingsScopeArgs {
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+}
+
+impl MarketDrawingsScopeArgs {
+    pub fn normalize(self) -> Result<Self, AppError> {
+        Ok(Self {
+            market_kind: self.market_kind,
+            symbol: normalize_symbol(self.symbol)?,
+            timeframe: self.timeframe,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDrawingDto {
+    pub id: String,
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+    pub drawing_type: String,
+    pub color: String,
+    pub label: Option<String>,
+    pub payload_json: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDrawingUpsertArgs {
+    pub id: String,
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+    pub drawing_type: String,
+    pub color: String,
+    pub label: Option<String>,
+    pub payload_json: String,
+    pub created_at_ms: Option<i64>,
+}
+
+impl MarketDrawingUpsertArgs {
+    pub fn normalize(self) -> Result<Self, AppError> {
+        let id = self.id.trim().to_string();
+        if id.is_empty() {
+            return Err(AppError::InvalidArgument(
+                "drawing id must be non-empty".to_string(),
+            ));
+        }
+
+        let drawing_type = self.drawing_type.trim().to_string();
+        validate_drawing_type(&drawing_type)?;
+
+        let payload_json = self.payload_json.trim().to_string();
+        if payload_json.is_empty() {
+            return Err(AppError::InvalidArgument(
+                "payloadJson must be non-empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id,
+            market_kind: self.market_kind,
+            symbol: normalize_symbol(self.symbol)?,
+            timeframe: self.timeframe,
+            drawing_type,
+            color: normalize_color(self.color)?,
+            label: normalize_optional_label(self.label)?,
+            payload_json,
+            created_at_ms: self.created_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDrawingDeleteArgs {
+    pub id: String,
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+}
+
+impl MarketDrawingDeleteArgs {
+    pub fn normalize(self) -> Result<Self, AppError> {
+        let id = self.id.trim().to_string();
+        if id.is_empty() {
+            return Err(AppError::InvalidArgument(
+                "drawing id must be non-empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            id,
+            market_kind: self.market_kind,
+            symbol: normalize_symbol(self.symbol)?,
+            timeframe: self.timeframe,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDrawingDeleteResult {
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -570,11 +826,24 @@ mod tests {
     }
 
     #[test]
+    fn market_kind_parse_is_supported() {
+        assert_eq!(
+            MarketKind::parse_str("spot").expect("spot should parse"),
+            MarketKind::Spot
+        );
+        assert_eq!(
+            MarketKind::parse_str("futures_usdm").expect("futures_usdm should parse"),
+            MarketKind::FuturesUsdm
+        );
+    }
+
+    #[test]
     fn normalizes_start_args_defaults() {
         let config = StartMarketStreamArgs::default()
             .normalize()
             .expect("defaults should be valid");
 
+        assert_eq!(config.market_kind, DEFAULT_MARKET_KIND);
         assert_eq!(config.symbol, DEFAULT_SYMBOL);
         assert_eq!(config.min_notional_usdt, DEFAULT_MIN_NOTIONAL_USDT);
         assert_eq!(config.emit_interval_ms, DEFAULT_EMIT_INTERVAL_MS);
@@ -600,6 +869,7 @@ mod tests {
     #[test]
     fn validates_emit_interval_range() {
         let result = StartMarketStreamArgs {
+            market_kind: Some(MarketKind::Spot),
             symbol: Some("BTCUSDT".to_string()),
             min_notional_usdt: Some(50.0),
             emit_interval_ms: Some(1),
@@ -620,6 +890,7 @@ mod tests {
     #[test]
     fn validates_history_limit_range() {
         let result = StartMarketStreamArgs {
+            market_kind: Some(MarketKind::Spot),
             symbol: Some("BTCUSDT".to_string()),
             min_notional_usdt: Some(50.0),
             emit_interval_ms: Some(16),
@@ -640,6 +911,7 @@ mod tests {
     #[test]
     fn validates_clock_sync_interval_range() {
         let result = StartMarketStreamArgs {
+            market_kind: Some(MarketKind::Spot),
             symbol: Some("BTCUSDT".to_string()),
             min_notional_usdt: Some(50.0),
             emit_interval_ms: Some(16),
@@ -655,5 +927,38 @@ mod tests {
         .normalize();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalizes_market_preferences_and_drawings_args() {
+        let preferences = SaveMarketPreferencesArgs {
+            market_kind: MarketKind::FuturesUsdm,
+            symbol: "btcusdt".to_string(),
+            timeframe: MarketTimeframe::M5,
+            magnet_strong: true,
+        }
+        .normalize()
+        .expect("preferences should normalize");
+
+        assert_eq!(preferences.symbol, "BTCUSDT");
+
+        let drawing = MarketDrawingUpsertArgs {
+            id: "  draw-1  ".to_string(),
+            market_kind: MarketKind::Spot,
+            symbol: " ethusdt ".to_string(),
+            timeframe: MarketTimeframe::M1,
+            drawing_type: "trendLine".to_string(),
+            color: "#aabbcc".to_string(),
+            label: Some("  Test label  ".to_string()),
+            payload_json: " {\"foo\":1} ".to_string(),
+            created_at_ms: None,
+        }
+        .normalize()
+        .expect("drawing should normalize");
+
+        assert_eq!(drawing.id, "draw-1");
+        assert_eq!(drawing.symbol, "ETHUSDT");
+        assert_eq!(drawing.color, "#AABBCC");
+        assert_eq!(drawing.label.as_deref(), Some("Test label"));
     }
 }

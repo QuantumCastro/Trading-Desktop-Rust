@@ -1,4 +1,5 @@
 pub mod binance;
+pub mod persistence;
 pub mod pipeline;
 pub mod types;
 
