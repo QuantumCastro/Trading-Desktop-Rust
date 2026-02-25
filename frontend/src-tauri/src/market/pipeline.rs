@@ -1,12 +1,14 @@
 use crate::error::AppError;
 use crate::market::binance::{
-    connect_agg_trade_stream, fetch_klines_delta_history, fetch_klines_history,
-    fetch_latest_agg_trade_snapshot, fetch_server_time_ms,
+    connect_agg_trade_stream, fetch_klines_history_bundle,
+    fetch_klines_history_bundle_with_progress, fetch_latest_agg_trade_snapshot,
+    fetch_server_time_ms,
 };
 use crate::market::types::{
     parse_agg_trade_payload, AggTradeEvent, MarketConnectionState, MarketKind, MarketPerfSnapshot,
     MarketStartupMode, MarketStreamConfig, MarketStreamStatusSnapshot, MarketTimeframe, UiCandle,
-    UiCandlesBootstrap, UiDeltaCandle, UiDeltaCandlesBootstrap, UiMarketFrameUpdate, UiTick,
+    UiCandlesBootstrap, UiDeltaCandle, UiDeltaCandlesBootstrap, UiHistoryLoadProgress,
+    UiMarketFrameUpdate, UiTick, DEFAULT_HISTORY_LIMIT,
 };
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -22,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     CANDLES_BOOTSTRAP_EVENT, CANDLE_UPDATE_EVENT, DELTA_CANDLES_BOOTSTRAP_EVENT,
-    DELTA_CANDLE_UPDATE_EVENT, MARKET_FRAME_UPDATE_EVENT, MARKET_PERF_EVENT, MARKET_STATUS_EVENT,
-    PRICE_UPDATE_EVENT,
+    DELTA_CANDLE_UPDATE_EVENT, HISTORY_LOAD_PROGRESS_EVENT, MARKET_FRAME_UPDATE_EVENT,
+    MARKET_PERF_EVENT, MARKET_STATUS_EVENT, PRICE_UPDATE_EVENT,
 };
 
 const STATUS_HEARTBEAT_MS: u64 = 1_000;
@@ -34,6 +36,7 @@ const CLOCK_SYNC_PROBE_SPACING_MS: u64 = 80;
 const CLOCK_SYNC_MAX_VALID_RTT_MS: i64 = 2_000;
 const CLOCK_SYNC_MIN_DELAY_MS: u64 = 10_000;
 const CLOCK_SYNC_MAX_DELAY_MS: u64 = 90_000;
+const HISTORY_PROGRESS_EMIT_THROTTLE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy)]
 struct ClockOffsetProbe {
@@ -1032,45 +1035,81 @@ async fn load_and_emit_history(
     }
 
     let (candles, delta_candles) = if config.mock_mode {
-        (
-            build_mock_history(config.timeframe, config.history_limit, now_unix_ms()),
-            build_mock_delta_history(config.timeframe, config.history_limit, now_unix_ms()),
-        )
-    } else {
-        let candles_future = fetch_klines_history(
-            http_client,
-            config.market_kind,
-            &config.symbol,
-            config.timeframe,
-            config.history_limit,
-        );
-        let delta_future = fetch_klines_delta_history(
-            http_client,
-            config.market_kind,
-            &config.symbol,
-            config.timeframe,
-            config.history_limit,
-        );
-        let (candles_result, delta_result) = tokio::join!(candles_future, delta_future);
-        let candles = candles_result?;
-        let delta_candles = match delta_result {
-            Ok(candles) => candles,
-            Err(error) => {
-                publish_status(
-                    status_store,
-                    window,
-                    telemetry,
-                    MarketConnectionState::Connecting,
-                    config.market_kind,
-                    &config.symbol,
-                    config.timeframe,
-                    Some(format!("delta history unavailable: {error}")),
-                )
-                .await;
-                Vec::new()
-            }
+        let history_limit = if config.history_all {
+            DEFAULT_HISTORY_LIMIT
+        } else {
+            config.history_limit
         };
-        (candles, delta_candles)
+        (
+            build_mock_history(config.timeframe, history_limit, now_unix_ms()),
+            build_mock_delta_history(config.timeframe, history_limit, now_unix_ms()),
+        )
+    } else if config.history_all {
+        window.emit(
+            HISTORY_LOAD_PROGRESS_EVENT,
+            UiHistoryLoadProgress {
+                market_kind: config.market_kind,
+                symbol: config.symbol.clone(),
+                timeframe: config.timeframe,
+                pages_fetched: 0,
+                candles_fetched: 0,
+                estimated_total_candles: None,
+                progress_pct: Some(0.0),
+                done: false,
+            },
+        )?;
+
+        let progress_started_at = Instant::now();
+        let mut last_progress_emit_at = progress_started_at
+            .checked_sub(Duration::from_millis(HISTORY_PROGRESS_EMIT_THROTTLE_MS))
+            .unwrap_or(progress_started_at);
+
+        fetch_klines_history_bundle_with_progress(
+            http_client,
+            config.market_kind,
+            &config.symbol,
+            config.timeframe,
+            config.history_limit,
+            true,
+            |progress| {
+                if cancel_token.is_cancelled() {
+                    return Ok(());
+                }
+
+                let now = Instant::now();
+                let should_emit = progress.done
+                    || now.duration_since(last_progress_emit_at)
+                        >= Duration::from_millis(HISTORY_PROGRESS_EMIT_THROTTLE_MS);
+                if !should_emit {
+                    return Ok(());
+                }
+
+                last_progress_emit_at = now;
+                let payload = UiHistoryLoadProgress {
+                    market_kind: config.market_kind,
+                    symbol: config.symbol.clone(),
+                    timeframe: config.timeframe,
+                    pages_fetched: progress.pages_fetched,
+                    candles_fetched: progress.candles_fetched,
+                    estimated_total_candles: progress.estimated_total_candles,
+                    progress_pct: progress.progress_pct,
+                    done: progress.done,
+                };
+                window.emit(HISTORY_LOAD_PROGRESS_EVENT, payload)?;
+                Ok(())
+            },
+        )
+        .await?
+    } else {
+        fetch_klines_history_bundle(
+            http_client,
+            config.market_kind,
+            &config.symbol,
+            config.timeframe,
+            config.history_limit,
+            false,
+        )
+        .await?
     };
 
     if cancel_token.is_cancelled() {
@@ -1126,7 +1165,7 @@ async fn current_operational_state(
 
 fn build_mock_history(
     timeframe: MarketTimeframe,
-    history_limit: u16,
+    history_limit: u32,
     now_ms: i64,
 ) -> Vec<UiCandle> {
     let timeframe_ms = timeframe.duration_ms();
@@ -1159,7 +1198,7 @@ fn build_mock_history(
 
 fn build_mock_delta_history(
     timeframe: MarketTimeframe,
-    history_limit: u16,
+    history_limit: u32,
     now_ms: i64,
 ) -> Vec<UiDeltaCandle> {
     let timeframe_ms = timeframe.duration_ms();

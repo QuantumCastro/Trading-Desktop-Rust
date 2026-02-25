@@ -1,11 +1,13 @@
 import { useStore } from "@nanostores/react";
 import {
   ArrowUp,
+  BarChart3,
   Magnet,
   Minus,
   MousePointer2,
   Percent,
   Ruler,
+  Trash2,
   TrendingUp,
   type LucideIcon,
 } from "lucide-react";
@@ -26,9 +28,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import type {
+  HistoryLoadProgress,
   MarketConnectionState,
   MarketDrawingsScopeArgs,
   MarketKind,
@@ -84,7 +88,8 @@ const DEFAULT_STREAM_ARGS = {
   perfTelemetry: false,
   clockSyncIntervalMs: 30_000,
   startupMode: "live_first",
-  historyLimit: 5_000,
+  historyLimit: 1_000,
+  historyAll: false,
 } as const;
 
 const PRICE_CHART_HEIGHT_PX = 456;
@@ -169,7 +174,20 @@ type CandleSnapshot = {
   high: number;
   low: number;
   close: number;
+  volume: number;
 };
+
+type HistoryLoadWidgetState = {
+  pagesFetched: number;
+  candlesFetched: number;
+  estimatedTotalCandles: number | null;
+  progressPct: number | null;
+  done: boolean;
+};
+
+const MIN_HISTORY_REQUEST_CANDLES = 1;
+const MAX_HISTORY_REQUEST_CANDLES = 2_000_000;
+const DEFAULT_HISTORY_REQUEST_CANDLES = 1_000;
 
 const CHART_TOOL_OPTIONS: ReadonlyArray<ChartToolOption> = [
   { id: "selection", label: "Modo selección", Icon: MousePointer2 },
@@ -242,6 +260,8 @@ const hasFiniteNumber = (value: number | null): value is number =>
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(Math.max(value, min), max);
+
+const formatInteger = (value: number): string => value.toLocaleString("en-US");
 
 const distance = (a: CanvasPoint, b: CanvasPoint): number => {
   const dx = a.x - b.x;
@@ -325,6 +345,7 @@ const toCandleSnapshot = (candle: UiCandle): CandleSnapshot => {
     high: candle.h,
     low: candle.l,
     close: candle.c,
+    volume: candle.v,
   };
 };
 
@@ -504,6 +525,8 @@ export const MarketPriceChartIsland = () => {
   const symbolsLoadingRef = useRef(false);
   const settingsSaveTimerRef = useRef<number | null>(null);
   const drawingStyleSaveTimerRef = useRef<number | null>(null);
+  const historyProgressHideTimerRef = useRef<number | null>(null);
+  const historyAllRequestedRef = useRef(false);
   const isHydratedRef = useRef(false);
   const requestedMarketKindRef = useRef<MarketKind>("spot");
   const isMagnetStrongRef = useRef(false);
@@ -522,11 +545,26 @@ export const MarketPriceChartIsland = () => {
   ]);
   const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
   const [horizontalLinePriceInput, setHorizontalLinePriceInput] = useState("");
+  const [drawingEditorViewportVersion, setDrawingEditorViewportVersion] = useState(0);
+  const [isHistoryLoadMenuOpen, setIsHistoryLoadMenuOpen] = useState(false);
+  const [historyRequestInput, setHistoryRequestInput] = useState(
+    String(DEFAULT_HISTORY_REQUEST_CANDLES),
+  );
+  const [isHistoryReloading, setIsHistoryReloading] = useState(false);
+  const [historyLoadWidget, setHistoryLoadWidget] = useState<HistoryLoadWidgetState | null>(null);
 
   const marketKind = useStore($marketKind);
   const symbol = useStore($marketSymbol);
   const timeframe = useStore($marketTimeframe);
   const drawings = useStore($marketDrawings);
+
+  const requestedHistoryLimit = useMemo(() => {
+    const numeric = Number(historyRequestInput.replace(",", "."));
+    if (!Number.isFinite(numeric)) {
+      return DEFAULT_HISTORY_REQUEST_CANDLES;
+    }
+    return clamp(Math.round(numeric), MIN_HISTORY_REQUEST_CANDLES, MAX_HISTORY_REQUEST_CANDLES);
+  }, [historyRequestInput]);
 
   const rebuildCandleIndex = (candles: ReadonlyArray<UiCandle>) => {
     const nextMap = new Map<UTCTimestamp, CandleSnapshot>();
@@ -602,6 +640,20 @@ export const MarketPriceChartIsland = () => {
       }
     }
   };
+
+  const renderCandlesOnSeries = useCallback((candles: ReadonlyArray<UiCandle>) => {
+    const series = candleSeriesRef.current;
+    const volumeSeries = volumeSeriesRef.current;
+    if (!series) {
+      return;
+    }
+    series.setData(candles.map(toCandlePoint));
+    volumeSeries?.setData(candles.map(toVolumePoint));
+    const lastCandle = candles[candles.length - 1];
+    if (lastCandle) {
+      updateCurrentPriceLine(lastCandle.c);
+    }
+  }, []);
 
   const activeScope = useMemo<MarketDrawingsScopeArgs>(
     () => ({
@@ -954,6 +1006,72 @@ export const MarketPriceChartIsland = () => {
         return [];
     }
   };
+
+  const selectedDrawingEditorStyle = useMemo<CSSProperties | null>(() => {
+    if (!selectedDrawing) {
+      return null;
+    }
+    void drawingEditorViewportVersion;
+
+    const resolveDrawingAnchorPoint = (drawing: PersistedDrawing): CanvasPoint | null => {
+      if (drawing.type === "horizontalLine") {
+        const y = yFromPrice(drawing.price);
+        const width = overlayMetricsRef.current.width;
+        if (!hasFiniteNumber(y) || width <= 0) {
+          return null;
+        }
+        return {
+          x: width * 0.72,
+          y,
+        };
+      }
+
+      const handles = drawingHandlePoints(drawing);
+      const canvasHandles = handles
+        .map((point) => canvasPointFromDataPoint(point))
+        .filter((point): point is CanvasPoint => point !== null);
+      if (canvasHandles.length === 0) {
+        return null;
+      }
+
+      const sum = canvasHandles.reduce(
+        (acc, point) => ({
+          x: acc.x + point.x,
+          y: acc.y + point.y,
+        }),
+        { x: 0, y: 0 },
+      );
+
+      return {
+        x: sum.x / canvasHandles.length,
+        y: sum.y / canvasHandles.length,
+      };
+    };
+
+    const anchor = resolveDrawingAnchorPoint(selectedDrawing);
+    const { width, height } = overlayMetricsRef.current;
+    if (width <= 0 || height <= 0) {
+      return null;
+    }
+
+    const maxWidgetWidth = selectedDrawing.type === "horizontalLine" ? 560 : 440;
+    const widgetHeight = 44;
+
+    if (!anchor) {
+      return {
+        left: "8px",
+        top: "8px",
+      };
+    }
+
+    const left = clamp(anchor.x + 12, 8, Math.max(8, width - maxWidgetWidth));
+    const top = clamp(anchor.y - widgetHeight - 8, 8, Math.max(8, height - widgetHeight - 8));
+
+    return {
+      left: `${Math.round(left)}px`,
+      top: `${Math.round(top)}px`,
+    };
+  }, [selectedDrawing, drawingEditorViewportVersion]);
 
   const translateDrawing = (
     drawing: PersistedDrawing,
@@ -1674,6 +1792,59 @@ export const MarketPriceChartIsland = () => {
     cancelCurrentDraft();
   };
 
+  const resetSeriesForStreamRestart = () => {
+    firstCandleTimeRef.current = null;
+    candleSnapshotsRef.current = new Map();
+    candleTimestampsRef.current = [];
+    hasBootstrapCandlesRef.current = false;
+    pendingLiveCandlesRef.current = new Map();
+    candleSeriesRef.current?.setData([]);
+    volumeSeriesRef.current?.setData([]);
+    applyDeltaCandlesBootstrap([]);
+    setMarketVisibleLogicalRange(null);
+    requestOverlayRedraw();
+  };
+
+  const startStreamWithHistory = async ({
+    nextMarketKind,
+    nextSymbol,
+    nextTimeframe,
+    historyLimit,
+    historyAll,
+  }: {
+    nextMarketKind: MarketKind;
+    nextSymbol: string;
+    nextTimeframe: MarketTimeframe;
+    historyLimit: number;
+    historyAll: boolean;
+  }) => {
+    desiredMarketKindRef.current = nextMarketKind;
+    desiredTimeframeRef.current = nextTimeframe;
+    desiredSymbolRef.current = nextSymbol;
+    requestedMarketKindRef.current = nextMarketKind;
+    requestedTimeframeRef.current = nextTimeframe;
+    requestedSymbolRef.current = nextSymbol;
+    if (!historyAll) {
+      historyAllRequestedRef.current = false;
+      if (historyProgressHideTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(historyProgressHideTimerRef.current);
+        historyProgressHideTimerRef.current = null;
+      }
+      setHistoryLoadWidget(null);
+    }
+    resetSeriesForStreamRestart();
+    await invokeStartMarketStream({
+      ...DEFAULT_STREAM_ARGS,
+      marketKind: nextMarketKind,
+      symbol: nextSymbol,
+      timeframe: nextTimeframe,
+      historyLimit,
+      historyAll,
+      mockMode: shouldUseDeterministicMock(),
+    });
+    hasStartedRef.current = true;
+  };
+
   useEffect(() => {
     selectedToolRef.current = selectedTool;
     const chart = chartRef.current;
@@ -1729,6 +1900,9 @@ export const MarketPriceChartIsland = () => {
       }
       if (drawingStyleSaveTimerRef.current !== null && typeof window !== "undefined") {
         window.clearTimeout(drawingStyleSaveTimerRef.current);
+      }
+      if (historyProgressHideTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(historyProgressHideTimerRef.current);
       }
     };
   }, []);
@@ -1789,6 +1963,7 @@ export const MarketPriceChartIsland = () => {
       },
       rightPriceScale: {
         borderColor: "#cbd5e1",
+        autoScale: true,
       },
       timeScale: {
         borderColor: "#cbd5e1",
@@ -1852,6 +2027,9 @@ export const MarketPriceChartIsland = () => {
         setMarketVisibleLogicalRange({ from: range.from, to: range.to });
       } else {
         setMarketVisibleLogicalRange(null);
+      }
+      if (selectedDrawingIdRef.current !== null) {
+        setDrawingEditorViewportVersion((current) => current + 1);
       }
       requestOverlayRedraw();
     };
@@ -1934,6 +2112,9 @@ export const MarketPriceChartIsland = () => {
         width: Math.max(chartContainerRef.current.clientWidth, 320),
         height: PRICE_CHART_HEIGHT_PX,
       });
+      if (selectedDrawingIdRef.current !== null) {
+        setDrawingEditorViewportVersion((current) => current + 1);
+      }
       syncOverlaySize();
       requestOverlayRedraw();
     });
@@ -2008,29 +2189,6 @@ export const MarketPriceChartIsland = () => {
       }
     };
 
-    const startStream = async (
-      nextMarketKind: MarketKind,
-      nextTimeframe: MarketTimeframe,
-      nextSymbol: string,
-    ) => {
-      desiredMarketKindRef.current = nextMarketKind;
-      desiredTimeframeRef.current = nextTimeframe;
-      desiredSymbolRef.current = nextSymbol;
-      requestedMarketKindRef.current = nextMarketKind;
-      requestedTimeframeRef.current = nextTimeframe;
-      requestedSymbolRef.current = nextSymbol;
-      hasBootstrapCandlesRef.current = false;
-      pendingLiveCandlesRef.current = new Map();
-      await invokeStartMarketStream({
-        ...DEFAULT_STREAM_ARGS,
-        marketKind: nextMarketKind,
-        symbol: nextSymbol,
-        timeframe: nextTimeframe,
-        mockMode: shouldUseDeterministicMock(),
-      });
-      hasStartedRef.current = true;
-    };
-
     const boot = async () => {
       let nextMarketKind = marketKind;
       let nextSymbol = symbol;
@@ -2075,14 +2233,18 @@ export const MarketPriceChartIsland = () => {
           const volumeSeries = volumeSeriesRef.current;
 
           if (frame.candle && series) {
-            const point = toCandlePoint(frame.candle);
-            series.update(point);
-            volumeSeries?.update(toVolumePoint(frame.candle));
-            updateCurrentPriceLine(frame.candle.c);
-            if (!hasBootstrapCandlesRef.current) {
-              pendingLiveCandlesRef.current.set(Number(point.time), frame.candle);
-            }
+            const nextPoint = toCandlePoint(frame.candle);
             upsertCandleIndex(frame.candle);
+            if (!hasBootstrapCandlesRef.current) {
+              pendingLiveCandlesRef.current.set(Number(nextPoint.time), frame.candle);
+              series.update(nextPoint);
+              volumeSeries?.update(toVolumePoint(frame.candle));
+              updateCurrentPriceLine(frame.candle.c);
+            } else {
+              series.update(nextPoint);
+              volumeSeries?.update(toVolumePoint(frame.candle));
+              updateCurrentPriceLine(frame.candle.c);
+            }
             if (shouldRedrawOverlayOnMarketTick()) {
               requestOverlayRedraw();
             }
@@ -2098,16 +2260,16 @@ export const MarketPriceChartIsland = () => {
           setMarketFrontendRenderLatency(renderLatencyMs);
         },
         onCandlesBootstrap: (payload) => {
-          const series = candleSeriesRef.current;
-          const volumeSeries = volumeSeriesRef.current;
-          if (!series) {
+          const chart = chartRef.current;
+          if (!candleSeriesRef.current) {
             return;
           }
+          chart?.priceScale("right").applyOptions({ autoScale: true });
           const mergedCandles = mergeCandlesByTime(payload.candles, pendingLiveCandlesRef.current);
-          series.setData(mergedCandles.map(toCandlePoint));
-          volumeSeries?.setData(mergedCandles.map(toVolumePoint));
-          chartRef.current?.timeScale().fitContent();
-          const range = chartRef.current?.timeScale().getVisibleLogicalRange() ?? null;
+          renderCandlesOnSeries(mergedCandles);
+          chart?.timeScale().fitContent();
+          chart?.priceScale("right").applyOptions({ autoScale: false });
+          const range = chart?.timeScale().getVisibleLogicalRange() ?? null;
           if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
             setMarketVisibleLogicalRange({ from: range.from, to: range.to });
           }
@@ -2136,6 +2298,39 @@ export const MarketPriceChartIsland = () => {
         onPerf: (snapshot) => {
           applyMarketPerfSnapshot(snapshot);
         },
+        onHistoryLoadProgress: (progress: HistoryLoadProgress) => {
+          const isStaleProgress =
+            progress.marketKind !== desiredMarketKindRef.current ||
+            progress.symbol !== desiredSymbolRef.current ||
+            progress.timeframe !== desiredTimeframeRef.current;
+          if (isStaleProgress) {
+            return;
+          }
+          if (!historyAllRequestedRef.current && !progress.done) {
+            return;
+          }
+
+          setHistoryLoadWidget({
+            pagesFetched: progress.pagesFetched,
+            candlesFetched: progress.candlesFetched,
+            estimatedTotalCandles: progress.estimatedTotalCandles,
+            progressPct: progress.progressPct,
+            done: progress.done,
+          });
+
+          if (progress.done) {
+            historyAllRequestedRef.current = false;
+            if (historyProgressHideTimerRef.current !== null && typeof window !== "undefined") {
+              window.clearTimeout(historyProgressHideTimerRef.current);
+            }
+            if (typeof window !== "undefined") {
+              historyProgressHideTimerRef.current = window.setTimeout(() => {
+                historyProgressHideTimerRef.current = null;
+                setHistoryLoadWidget(null);
+              }, 1_500);
+            }
+          }
+        },
       });
 
       if (disposed) {
@@ -2146,7 +2341,13 @@ export const MarketPriceChartIsland = () => {
       unlisten = unlistenEvents;
 
       try {
-        await startStream(nextMarketKind, nextTimeframe, nextSymbol);
+        await startStreamWithHistory({
+          nextMarketKind,
+          nextSymbol,
+          nextTimeframe,
+          historyLimit: DEFAULT_HISTORY_REQUEST_CANDLES,
+          historyAll: false,
+        });
         isHydratedRef.current = true;
       } catch (error) {
         console.error("No se pudo iniciar market stream", error);
@@ -2162,6 +2363,9 @@ export const MarketPriceChartIsland = () => {
       }
       if (drawingStyleSaveTimerRef.current !== null && typeof window !== "undefined") {
         window.clearTimeout(drawingStyleSaveTimerRef.current);
+      }
+      if (historyProgressHideTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(historyProgressHideTimerRef.current);
       }
       unlisten?.();
       resetMarketStatus();
@@ -2263,28 +2467,12 @@ export const MarketPriceChartIsland = () => {
       return;
     }
 
-    firstCandleTimeRef.current = null;
-    candleSnapshotsRef.current = new Map();
-    candleTimestampsRef.current = [];
-    hasBootstrapCandlesRef.current = false;
-    pendingLiveCandlesRef.current = new Map();
-    candleSeriesRef.current?.setData([]);
-    volumeSeriesRef.current?.setData([]);
-    applyDeltaCandlesBootstrap([]);
-    setMarketVisibleLogicalRange(null);
-
-    requestedMarketKindRef.current = marketKind;
-    requestedTimeframeRef.current = timeframe;
-    requestedSymbolRef.current = symbol;
-    desiredMarketKindRef.current = marketKind;
-    desiredTimeframeRef.current = timeframe;
-    desiredSymbolRef.current = symbol;
-    void invokeStartMarketStream({
-      ...DEFAULT_STREAM_ARGS,
-      marketKind,
-      symbol,
-      timeframe,
-      mockMode: shouldUseDeterministicMock(),
+    void startStreamWithHistory({
+      nextMarketKind: marketKind,
+      nextSymbol: symbol,
+      nextTimeframe: timeframe,
+      historyLimit: DEFAULT_HISTORY_REQUEST_CANDLES,
+      historyAll: false,
     })
       .then(() => {
         hasStartedRef.current = true;
@@ -2292,13 +2480,69 @@ export const MarketPriceChartIsland = () => {
       .catch((error) => {
         console.error("No se pudo reiniciar market stream por cambio de mercado/símbolo/TF", error);
       });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSymbolsLoading, marketKind, symbol, timeframe]);
+
+  const reloadHistoryFromRest = async (historyAll: boolean) => {
+    if (!hasTauriRuntime() || !hasStartedRef.current || isHistoryReloading) {
+      return;
+    }
+
+    if (historyAll) {
+      historyAllRequestedRef.current = true;
+      if (historyProgressHideTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(historyProgressHideTimerRef.current);
+        historyProgressHideTimerRef.current = null;
+      }
+      setHistoryLoadWidget({
+        pagesFetched: 0,
+        candlesFetched: 0,
+        estimatedTotalCandles: null,
+        progressPct: 0,
+        done: false,
+      });
+    } else {
+      historyAllRequestedRef.current = false;
+      setHistoryLoadWidget(null);
+    }
+
+    setIsHistoryReloading(true);
+    try {
+      await startStreamWithHistory({
+        nextMarketKind: marketKind,
+        nextSymbol: symbol,
+        nextTimeframe: timeframe,
+        historyLimit: requestedHistoryLimit,
+        historyAll,
+      });
+      setIsHistoryLoadMenuOpen(false);
+    } catch (error) {
+      historyAllRequestedRef.current = false;
+      console.error("No se pudo recargar historial por REST", error);
+      if (historyAll) {
+        setHistoryLoadWidget(null);
+      }
+    } finally {
+      setIsHistoryReloading(false);
+    }
+  };
+
+  const historyProgressBarPct = historyLoadWidget
+    ? Math.round(clamp(historyLoadWidget.progressPct ?? 0, 0, 100))
+    : 0;
+  const historyProgressLabel = historyLoadWidget
+    ? historyLoadWidget.progressPct === null
+      ? historyLoadWidget.done
+        ? "100%"
+        : "..."
+      : `${historyProgressBarPct}%`
+    : "";
 
   return (
     <section className="w-full rounded-md border border-slate-200 bg-white p-0 shadow-sm dark:border-slate-700 dark:bg-slate-900">
       <div className="mb-1 flex w-full flex-wrap items-center gap-2 px-1 py-1 text-sm text-slate-700 dark:text-slate-300">
         <div
-          className="flex shrink-0 items-center gap-1 rounded-md border border-slate-200 bg-slate-50 p-1.5 dark:border-slate-700 dark:bg-slate-800/80"
+          className="flex w-[308px] shrink-0 items-center gap-1 overflow-x-auto overflow-y-hidden rounded-md border border-slate-200 bg-slate-50 p-1.5 dark:border-slate-700 dark:bg-slate-800/80"
           data-testid="chart-tool-panel"
         >
           {CHART_TOOL_OPTIONS.map((tool) => {
@@ -2308,7 +2552,7 @@ export const MarketPriceChartIsland = () => {
               <button
                 aria-label={tool.label}
                 aria-pressed={isActive}
-                className={`flex h-[38px] w-[38px] items-center justify-center rounded-sm border transition-colors ${
+                className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-sm border transition-colors ${
                   isActive
                     ? "border-sky-500 bg-sky-100 text-sky-700 dark:border-sky-400 dark:bg-sky-950/70 dark:text-sky-300"
                     : "border-transparent bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-100 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-700"
@@ -2330,7 +2574,7 @@ export const MarketPriceChartIsland = () => {
           <button
             aria-label="Imán fuerte"
             aria-pressed={isMagnetStrong}
-            className={`flex h-[38px] w-[38px] items-center justify-center rounded-sm border transition-colors ${
+            className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-sm border transition-colors ${
               isMagnetStrong
                 ? "border-emerald-500 bg-emerald-100 text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/70 dark:text-emerald-300"
                 : "border-transparent bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-100 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-700"
@@ -2344,6 +2588,72 @@ export const MarketPriceChartIsland = () => {
           >
             <Magnet className="h-[18px] w-[18px]" />
           </button>
+          <div className="mx-1 h-6 w-px shrink-0 bg-slate-300 dark:bg-slate-600" />
+          <button
+            aria-label="Eliminar todos los dibujos"
+            className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-sm border border-rose-300 bg-rose-50 text-rose-700 transition-colors hover:bg-rose-100 dark:border-rose-500/70 dark:bg-rose-950/40 dark:text-rose-300 dark:hover:bg-rose-900/50"
+            data-testid="chart-tool-delete-all"
+            onClick={() => {
+              requestOverlayRedraw();
+              void clearAllDrawingsForScope(activeScope);
+            }}
+            title="Eliminar todos los dibujos"
+            type="button"
+          >
+            <Trash2 className="h-[18px] w-[18px]" />
+          </button>
+          <div className="mx-1 h-6 w-px shrink-0 bg-slate-300 dark:bg-slate-600" />
+          <button
+            aria-label="Configurar carga histórica"
+            aria-pressed={isHistoryLoadMenuOpen}
+            className={`flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-sm border transition-colors ${
+              isHistoryLoadMenuOpen
+                ? "border-sky-500 bg-sky-100 text-sky-700 dark:border-sky-400 dark:bg-sky-950/70 dark:text-sky-300"
+                : "border-transparent bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-100 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-700"
+            }`}
+            data-testid="chart-tool-history-render"
+            onClick={() => {
+              setIsHistoryLoadMenuOpen((current) => !current);
+            }}
+            title="Cargar histórico REST"
+            type="button"
+          >
+            <BarChart3 className="h-[18px] w-[18px]" />
+          </button>
+          {isHistoryLoadMenuOpen ? (
+            <div className="ml-1 flex shrink-0 items-center gap-1 rounded-sm border border-slate-300 bg-white px-1 py-1 text-[11px] text-slate-700 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200">
+              <input
+                aria-label="Cantidad de velas para carga histórica"
+                className="w-[92px] rounded border border-slate-300 px-2 py-1 text-xs text-slate-900 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+                inputMode="numeric"
+                placeholder="Velas"
+                value={historyRequestInput}
+                onChange={(event) => {
+                  setHistoryRequestInput(event.target.value);
+                }}
+              />
+              <button
+                className="rounded bg-sky-100 px-2 py-1 font-semibold text-sky-700 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-sky-950/70 dark:text-sky-300"
+                disabled={isHistoryReloading}
+                onClick={() => {
+                  void reloadHistoryFromRest(false);
+                }}
+                type="button"
+              >
+                Cargar
+              </button>
+              <button
+                className="rounded bg-slate-100 px-2 py-1 font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-slate-700 dark:text-slate-200"
+                disabled={isHistoryReloading}
+                onClick={() => {
+                  void reloadHistoryFromRest(true);
+                }}
+                type="button"
+              >
+                Todas
+              </button>
+            </div>
+          ) : null}
         </div>
 
         <label
@@ -2415,25 +2725,67 @@ export const MarketPriceChartIsland = () => {
           </select>
         </label>
 
-        <span className="shrink-0 font-medium" data-testid="market-stream-symbol">
-          {marketKind === "spot" ? "Spot" : "Futures"} | {symbol}
-        </span>
         <MarketRuntimeSummary />
-        {drawings.length > 0 ? (
-          <button
-            className="rounded border border-rose-300 bg-rose-50 px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-100"
-            onClick={() => {
-              requestOverlayRedraw();
-              void clearAllDrawingsForScope(activeScope);
-            }}
-            type="button"
-          >
-            Eliminar todo
-          </button>
-        ) : null}
+      </div>
 
-        {selectedDrawing ? (
-          <div className="flex min-w-[280px] items-center gap-2 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700">
+      <div
+        className={`relative h-[456px] w-full rounded-md border border-slate-200 dark:border-slate-700 ${cursorClassByTool[selectedTool]}`}
+      >
+        <div className="h-full w-full" data-testid="market-price-chart" ref={chartContainerRef} />
+        <canvas
+          aria-hidden="true"
+          className={`absolute inset-0 z-20 h-full w-full touch-none ${
+            selectedTool === "selection" && !selectedDrawingId
+              ? "pointer-events-none"
+              : "pointer-events-auto"
+          } ${cursorClassByTool[selectedTool]}`}
+          data-active-tool={selectedTool}
+          data-testid="market-drawing-overlay"
+          ref={overlayCanvasRef}
+          onPointerCancel={handleOverlayPointerCancel}
+          onPointerDown={handleOverlayPointerDown}
+          onPointerLeave={handleOverlayPointerLeave}
+          onPointerMove={handleOverlayPointerMove}
+          onPointerUp={handleOverlayPointerUp}
+        />
+        {historyLoadWidget ? (
+          <div className="pointer-events-none absolute right-2 top-2 z-40 w-[272px] rounded-md border border-slate-300 bg-white/95 p-2 text-[11px] text-slate-700 shadow-lg backdrop-blur-sm dark:border-slate-600 dark:bg-slate-900/90 dark:text-slate-100">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="font-semibold">Cargando histórico completo</span>
+              <span className="font-semibold">{historyProgressLabel}</span>
+            </div>
+            <div className="h-1.5 overflow-hidden rounded bg-slate-200 dark:bg-slate-700">
+              <div
+                className={`h-full transition-all duration-200 ${
+                  historyLoadWidget.done ? "bg-emerald-500" : "bg-sky-500"
+                }`}
+                style={{ width: `${historyProgressBarPct}%` }}
+              />
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[10px] text-slate-600 dark:text-slate-300">
+              <span>Paginas: {formatInteger(historyLoadWidget.pagesFetched)}</span>
+              <span>
+                Velas: {formatInteger(historyLoadWidget.candlesFetched)}
+                {historyLoadWidget.estimatedTotalCandles !== null
+                  ? ` / ~${formatInteger(historyLoadWidget.estimatedTotalCandles)}`
+                  : ""}
+              </span>
+            </div>
+            {historyLoadWidget.done ? (
+              <div className="mt-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                Carga completa finalizada
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {selectedDrawing && selectedDrawingEditorStyle ? (
+          <div
+            className="absolute z-30 flex min-w-[320px] max-w-[560px] items-center gap-2 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 shadow-md"
+            style={selectedDrawingEditorStyle}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+            }}
+          >
             <span className="font-semibold uppercase tracking-wide">Drawing</span>
             <input
               aria-label="Color drawing"
@@ -2517,28 +2869,6 @@ export const MarketPriceChartIsland = () => {
             </button>
           </div>
         ) : null}
-      </div>
-
-      <div
-        className={`relative h-[456px] w-full rounded-md border border-slate-200 dark:border-slate-700 ${cursorClassByTool[selectedTool]}`}
-      >
-        <div className="h-full w-full" data-testid="market-price-chart" ref={chartContainerRef} />
-        <canvas
-          aria-hidden="true"
-          className={`absolute inset-0 z-20 h-full w-full touch-none ${
-            selectedTool === "selection" && !selectedDrawingId
-              ? "pointer-events-none"
-              : "pointer-events-auto"
-          } ${cursorClassByTool[selectedTool]}`}
-          data-active-tool={selectedTool}
-          data-testid="market-drawing-overlay"
-          ref={overlayCanvasRef}
-          onPointerCancel={handleOverlayPointerCancel}
-          onPointerDown={handleOverlayPointerDown}
-          onPointerLeave={handleOverlayPointerLeave}
-          onPointerMove={handleOverlayPointerMove}
-          onPointerUp={handleOverlayPointerUp}
-        />
       </div>
 
       {!hasTauriRuntime() ? (

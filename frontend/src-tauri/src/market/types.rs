@@ -12,13 +12,13 @@ pub const DEFAULT_CLOCK_SYNC_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MARKET_KIND: MarketKind = MarketKind::Spot;
 pub const DEFAULT_TIMEFRAME: MarketTimeframe = MarketTimeframe::M1;
 pub const DEFAULT_STARTUP_MODE: MarketStartupMode = MarketStartupMode::LiveFirst;
-pub const DEFAULT_HISTORY_LIMIT: u16 = 5_000;
+pub const DEFAULT_HISTORY_LIMIT: u32 = 1_000;
 pub const MIN_EMIT_INTERVAL_MS: u64 = 8;
 pub const MAX_EMIT_INTERVAL_MS: u64 = 1_000;
 pub const MIN_CLOCK_SYNC_INTERVAL_MS: u64 = 5_000;
 pub const MAX_CLOCK_SYNC_INTERVAL_MS: u64 = 300_000;
-pub const MIN_HISTORY_LIMIT: u16 = 50;
-pub const MAX_HISTORY_LIMIT: u16 = 10_000;
+pub const MIN_HISTORY_LIMIT: u32 = 1;
+pub const MAX_HISTORY_LIMIT: u32 = 2_000_000;
 pub const MAX_DRAWING_LABEL_LEN: usize = 120;
 
 const SUPPORTED_DRAWING_TYPES: [&str; 5] = [
@@ -181,7 +181,8 @@ pub struct StartMarketStreamArgs {
     pub clock_sync_interval_ms: Option<u64>,
     pub timeframe: Option<MarketTimeframe>,
     pub startup_mode: Option<MarketStartupMode>,
-    pub history_limit: Option<u16>,
+    pub history_limit: Option<u32>,
+    pub history_all: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +198,8 @@ pub struct MarketStreamConfig {
     pub clock_sync_interval_ms: u64,
     pub timeframe: MarketTimeframe,
     pub startup_mode: MarketStartupMode,
-    pub history_limit: u16,
+    pub history_limit: u32,
+    pub history_all: bool,
 }
 
 fn normalize_symbol(symbol: String) -> Result<String, AppError> {
@@ -296,12 +298,18 @@ impl StartMarketStreamArgs {
         }
         let timeframe = self.timeframe.unwrap_or(DEFAULT_TIMEFRAME);
         let startup_mode = self.startup_mode.unwrap_or(DEFAULT_STARTUP_MODE);
-        let history_limit = self.history_limit.unwrap_or(DEFAULT_HISTORY_LIMIT);
-        if !(MIN_HISTORY_LIMIT..=MAX_HISTORY_LIMIT).contains(&history_limit) {
-            return Err(AppError::InvalidArgument(format!(
-                "historyLimit must be between {MIN_HISTORY_LIMIT} and {MAX_HISTORY_LIMIT}"
-            )));
-        }
+        let history_all = self.history_all.unwrap_or(false);
+        let history_limit = if history_all {
+            DEFAULT_HISTORY_LIMIT
+        } else {
+            let requested = self.history_limit.unwrap_or(DEFAULT_HISTORY_LIMIT);
+            if !(MIN_HISTORY_LIMIT..=MAX_HISTORY_LIMIT).contains(&requested) {
+                return Err(AppError::InvalidArgument(format!(
+                    "historyLimit must be between {MIN_HISTORY_LIMIT} and {MAX_HISTORY_LIMIT}"
+                )));
+            }
+            requested
+        };
 
         Ok(MarketStreamConfig {
             market_kind,
@@ -316,6 +324,7 @@ impl StartMarketStreamArgs {
             timeframe,
             startup_mode,
             history_limit,
+            history_all,
         })
     }
 }
@@ -335,7 +344,8 @@ pub struct MarketStreamSession {
     pub clock_sync_interval_ms: u64,
     pub timeframe: MarketTimeframe,
     pub startup_mode: MarketStartupMode,
-    pub history_limit: u16,
+    pub history_limit: u32,
+    pub history_all: bool,
 }
 
 impl MarketStreamSession {
@@ -354,6 +364,7 @@ impl MarketStreamSession {
             timeframe: config.timeframe,
             startup_mode: config.startup_mode,
             history_limit: config.history_limit,
+            history_all: config.history_all,
         }
     }
 }
@@ -615,6 +626,19 @@ pub struct UiDeltaCandlesBootstrap {
     pub candles: Vec<UiDeltaCandle>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiHistoryLoadProgress {
+    pub market_kind: MarketKind,
+    pub symbol: String,
+    pub timeframe: MarketTimeframe,
+    pub pages_fetched: u32,
+    pub candles_fetched: u64,
+    pub estimated_total_candles: Option<u64>,
+    pub progress_pct: Option<f64>,
+    pub done: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketPerfSnapshot {
@@ -864,6 +888,7 @@ mod tests {
         assert_eq!(config.timeframe, DEFAULT_TIMEFRAME);
         assert_eq!(config.startup_mode, DEFAULT_STARTUP_MODE);
         assert_eq!(config.history_limit, DEFAULT_HISTORY_LIMIT);
+        assert!(!config.history_all);
     }
 
     #[test]
@@ -881,6 +906,7 @@ mod tests {
             timeframe: None,
             startup_mode: None,
             history_limit: None,
+            history_all: None,
         }
         .normalize();
 
@@ -888,8 +914,32 @@ mod tests {
     }
 
     #[test]
-    fn validates_history_limit_range() {
-        let result = StartMarketStreamArgs {
+    fn keeps_explicit_history_limit_when_not_all() {
+        let config = StartMarketStreamArgs {
+            market_kind: Some(MarketKind::Spot),
+            symbol: Some("BTCUSDT".to_string()),
+            min_notional_usdt: Some(50.0),
+            emit_interval_ms: Some(16),
+            mock_mode: None,
+            emit_legacy_price_event: None,
+            emit_legacy_frame_events: None,
+            perf_telemetry: None,
+            clock_sync_interval_ms: None,
+            timeframe: Some(MarketTimeframe::M1),
+            startup_mode: None,
+            history_limit: Some(25_000),
+            history_all: Some(false),
+        }
+        .normalize()
+        .expect("history limit should be preserved");
+
+        assert_eq!(config.history_limit, 25_000);
+        assert!(!config.history_all);
+    }
+
+    #[test]
+    fn history_all_uses_default_chunk_limit() {
+        let config = StartMarketStreamArgs {
             market_kind: Some(MarketKind::Spot),
             symbol: Some("BTCUSDT".to_string()),
             min_notional_usdt: Some(50.0),
@@ -902,10 +952,13 @@ mod tests {
             timeframe: Some(MarketTimeframe::M1),
             startup_mode: None,
             history_limit: Some(10),
+            history_all: Some(true),
         }
-        .normalize();
+        .normalize()
+        .expect("history all should normalize");
 
-        assert!(result.is_err());
+        assert!(config.history_all);
+        assert_eq!(config.history_limit, DEFAULT_HISTORY_LIMIT);
     }
 
     #[test]
@@ -923,6 +976,7 @@ mod tests {
             timeframe: Some(MarketTimeframe::M1),
             startup_mode: None,
             history_limit: Some(500),
+            history_all: None,
         }
         .normalize();
 

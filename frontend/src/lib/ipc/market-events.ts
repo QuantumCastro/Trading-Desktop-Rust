@@ -1,5 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  historyLoadProgressSchema,
   marketFrameUpdateSchema,
   marketPerfSnapshotSchema,
   marketStatusSchema,
@@ -9,6 +10,7 @@ import {
   uiDeltaCandleSchema,
   uiTickSchema,
   type MarketFrameUpdate,
+  type HistoryLoadProgress,
   type MarketPerfSnapshot,
   type MarketStatus,
   type UiCandlesBootstrap,
@@ -27,6 +29,7 @@ type MarketEventHandlers = {
   onDeltaCandle?: (candle: UiDeltaCandle) => void;
   onDeltaCandlesBootstrap?: (payload: UiDeltaCandlesBootstrap) => void;
   onStatus?: (status: MarketStatus) => void;
+  onHistoryLoadProgress?: (progress: HistoryLoadProgress) => void;
 };
 
 const hasTauriRuntime = (): boolean => {
@@ -44,6 +47,8 @@ export const parseMarketFramePayload = (payload: unknown): MarketFrameUpdate =>
   marketFrameUpdateSchema.parse(payload);
 export const parseMarketPerfPayload = (payload: unknown): MarketPerfSnapshot =>
   marketPerfSnapshotSchema.parse(payload);
+export const parseHistoryLoadProgressPayload = (payload: unknown): HistoryLoadProgress =>
+  historyLoadProgressSchema.parse(payload);
 
 export const parseUiCandlePayload = (payload: unknown): UiCandle => uiCandleSchema.parse(payload);
 
@@ -160,6 +165,16 @@ export const listenMarketEvents = async (handlers: MarketEventHandlers): Promise
       }
     });
     unlistenFns.push(unlistenDeltaBootstrap);
+  }
+
+  if (handlers.onHistoryLoadProgress) {
+    const unlistenHistoryProgress = await listen<unknown>("history_load_progress", (event) => {
+      const parsed = historyLoadProgressSchema.safeParse(event.payload);
+      if (parsed.success) {
+        handlers.onHistoryLoadProgress?.(parsed.data);
+      }
+    });
+    unlistenFns.push(unlistenHistoryProgress);
   }
 
   return () => {

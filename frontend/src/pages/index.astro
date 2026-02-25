@@ -6,7 +6,10 @@ import MarketSharedCrosshairOverlayIsland from "../components/MarketSharedCrossh
 ---
 
 <BaseLayout>
-  <main class="relative flex min-h-[60vh] w-full flex-col gap-1 px-0 py-0" data-market-charts-root>
+  <main
+    class="relative flex min-h-[60vh] w-full flex-col gap-0.5 px-0 py-0"
+    data-market-charts-root
+  >
     <MarketPriceChartIsland client:only="react" />
     <MarketDeltaChartIsland client:only="react" />
     <MarketSharedCrosshairOverlayIsland client:only="react" />

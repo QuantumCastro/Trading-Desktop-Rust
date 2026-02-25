@@ -11,3 +11,4 @@ pub const CANDLE_UPDATE_EVENT: &str = "candle_update";
 pub const CANDLES_BOOTSTRAP_EVENT: &str = "candles_bootstrap";
 pub const DELTA_CANDLE_UPDATE_EVENT: &str = "delta_candle_update";
 pub const DELTA_CANDLES_BOOTSTRAP_EVENT: &str = "delta_candles_bootstrap";
+pub const HISTORY_LOAD_PROGRESS_EVENT: &str = "history_load_progress";

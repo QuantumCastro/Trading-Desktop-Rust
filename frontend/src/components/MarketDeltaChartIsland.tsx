@@ -13,8 +13,6 @@ import type { UiDeltaCandle } from "@lib/ipc/contracts";
 import {
   $marketDeltaCandles,
   $marketDeltaLiveUpdate,
-  $marketSymbol,
-  $marketTimeframe,
   $marketVisibleLogicalRange,
   clearMarketSharedCrosshairBySource,
   setMarketSharedCrosshair,
@@ -45,36 +43,27 @@ const hasTauriRuntime = (): boolean => {
   return "__TAURI_INTERNALS__" in window;
 };
 
-const deltaAutoscaleSymmetricAroundZero = (
-  baseImplementation: () => AutoscaleInfo | null,
-): AutoscaleInfo | null => {
-  const base = baseImplementation();
-  if (!base) {
-    return null;
-  }
-
-  const minVisible = base.priceRange.minValue;
-  const maxVisible = base.priceRange.maxValue;
-  const maxAbsVisible = Math.max(Math.abs(minVisible), Math.abs(maxVisible));
-  const range = Math.max(maxAbsVisible, 0.000_001);
-
-  return {
-    ...base,
-    priceRange: {
-      minValue: -range,
-      maxValue: range,
-    },
-  };
-};
+const maxAbsFromDeltaCandle = (candle: UiDeltaCandle): number =>
+  Math.max(Math.abs(candle.o), Math.abs(candle.h), Math.abs(candle.l), Math.abs(candle.c));
 
 export const MarketDeltaChartIsland = () => {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const deltaSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const symbol = useStore($marketSymbol);
-  const timeframe = useStore($marketTimeframe);
+  const lastKnownAbsDeltaRef = useRef<number>(1);
   const deltaCandles = useStore($marketDeltaCandles);
   const visibleRange = useStore($marketVisibleLogicalRange);
+
+  const updateLastKnownAbsDeltaFromCandles = (candles: ReadonlyArray<UiDeltaCandle>) => {
+    if (candles.length === 0) {
+      return;
+    }
+    let maxAbs = 0;
+    for (const candle of candles) {
+      maxAbs = Math.max(maxAbs, maxAbsFromDeltaCandle(candle));
+    }
+    lastKnownAbsDeltaRef.current = Math.max(maxAbs, 0.000_001);
+  };
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -95,6 +84,11 @@ export const MarketDeltaChartIsland = () => {
       },
       rightPriceScale: {
         borderColor: "#cbd5e1",
+        autoScale: true,
+        scaleMargins: {
+          top: 0.01,
+          bottom: 0.01,
+        },
       },
       timeScale: {
         borderColor: "#cbd5e1",
@@ -122,7 +116,23 @@ export const MarketDeltaChartIsland = () => {
       wickDownColor: "#dc2626",
       priceLineVisible: false,
       lastValueVisible: false,
-      autoscaleInfoProvider: deltaAutoscaleSymmetricAroundZero,
+      autoscaleInfoProvider: (baseImplementation: () => AutoscaleInfo | null): AutoscaleInfo => {
+        const base = baseImplementation();
+        const symmetricRange = base
+          ? Math.max(
+              Math.abs(base.priceRange.minValue),
+              Math.abs(base.priceRange.maxValue),
+              0.000_001,
+            )
+          : Math.max(lastKnownAbsDeltaRef.current, 0.000_001);
+
+        return {
+          priceRange: {
+            minValue: -symmetricRange,
+            maxValue: symmetricRange,
+          },
+        };
+      },
     });
     deltaSeries.createPriceLine({
       price: 0,
@@ -181,6 +191,7 @@ export const MarketDeltaChartIsland = () => {
       return;
     }
     if (!visibleRange) {
+      chart.timeScale().fitContent();
       return;
     }
     chart.timeScale().setVisibleLogicalRange(visibleRange);
@@ -191,14 +202,19 @@ export const MarketDeltaChartIsland = () => {
     if (!series) {
       return;
     }
+    updateLastKnownAbsDeltaFromCandles(deltaCandles);
     series.setData(deltaCandles.map(toDeltaPoint));
-  }, [deltaCandles]);
+    if (!visibleRange) {
+      chartRef.current?.timeScale().fitContent();
+    }
+  }, [deltaCandles, visibleRange]);
 
   useEffect(() => {
     const unlisten = $marketDeltaLiveUpdate.listen((update) => {
       if (!update) {
         return;
       }
+      lastKnownAbsDeltaRef.current = Math.max(maxAbsFromDeltaCandle(update.candle), 0.000_001);
       deltaSeriesRef.current?.update(toDeltaPoint(update.candle));
     });
 
@@ -208,13 +224,7 @@ export const MarketDeltaChartIsland = () => {
   }, []);
 
   return (
-    <section className="w-full rounded-md border border-slate-200 bg-white p-1 shadow-sm dark:border-slate-700 dark:bg-slate-900">
-      <div className="mb-1 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300">
-        <span className="font-semibold uppercase tracking-wide">Delta Volume</span>
-        <span>
-          {symbol} | {timeframe}
-        </span>
-      </div>
+    <section className="w-full rounded-md border border-slate-200 bg-white p-0 shadow-sm dark:border-slate-700 dark:bg-slate-900">
       <div className="h-[141px] w-full" data-testid="market-delta-chart" ref={chartContainerRef} />
       {!hasTauriRuntime() ? (
         <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900">

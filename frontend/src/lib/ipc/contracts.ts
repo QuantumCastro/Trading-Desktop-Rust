@@ -40,7 +40,8 @@ export const startMarketStreamArgsSchema = z
     clockSyncIntervalMs: z.number().int().min(5_000).max(300_000).optional(),
     timeframe: marketTimeframeSchema.optional(),
     startupMode: marketStartupModeSchema.optional(),
-    historyLimit: z.number().int().min(50).max(10_000).optional(),
+    historyLimit: z.number().int().min(1).max(2_000_000).optional(),
+    historyAll: z.boolean().optional(),
   })
   .strict();
 
@@ -57,7 +58,8 @@ export const marketStreamSessionSchema = z.object({
   clockSyncIntervalMs: z.number().int().min(5_000).max(300_000),
   timeframe: marketTimeframeSchema,
   startupMode: marketStartupModeSchema,
-  historyLimit: z.number().int().min(50).max(10_000),
+  historyLimit: z.number().int().min(1).max(2_000_000),
+  historyAll: z.boolean(),
 });
 
 export const marketStreamStopResultSchema = z.object({
@@ -231,6 +233,17 @@ export const marketPerfSnapshotSchema = z.object({
   emitCount: z.number().int().nonnegative(),
 });
 
+export const historyLoadProgressSchema = z.object({
+  marketKind: marketKindSchema,
+  symbol: z.string().min(1),
+  timeframe: marketTimeframeSchema,
+  pagesFetched: z.number().int().nonnegative(),
+  candlesFetched: z.number().int().nonnegative(),
+  estimatedTotalCandles: z.number().int().nonnegative().nullable(),
+  progressPct: z.number().finite().nullable(),
+  done: z.boolean(),
+});
+
 export const ipcResponseSchemas = {
   health: healthResponseSchema,
   app_info: appInfoResponseSchema,
@@ -273,6 +286,7 @@ export type UiCandlesBootstrap = z.infer<typeof uiCandlesBootstrapSchema>;
 export type UiDeltaCandle = z.infer<typeof uiDeltaCandleSchema>;
 export type UiDeltaCandlesBootstrap = z.infer<typeof uiDeltaCandlesBootstrapSchema>;
 export type MarketPerfSnapshot = z.infer<typeof marketPerfSnapshotSchema>;
+export type HistoryLoadProgress = z.infer<typeof historyLoadProgressSchema>;
 
 export type IpcCommandName = keyof typeof ipcResponseSchemas;
 
