@@ -88,6 +88,28 @@ const DEFAULT_STREAM_ARGS = {
 } as const;
 
 const PRICE_CHART_HEIGHT_PX = 456;
+const PRICE_CHART_INTERACTION_ENABLED = {
+  handleScroll: {
+    mouseWheel: true,
+    pressedMouseMove: true,
+    horzTouchDrag: true,
+    vertTouchDrag: true,
+  },
+  handleScale: {
+    axisPressedMouseMove: {
+      time: true,
+      price: true,
+    },
+    mouseWheel: true,
+    pinch: true,
+    axisDoubleClickReset: true,
+  },
+} as const;
+
+const PRICE_CHART_INTERACTION_DISABLED = {
+  handleScroll: false,
+  handleScale: false,
+} as const;
 
 type ChartTool =
   | "selection"
@@ -499,6 +521,7 @@ export const MarketPriceChartIsland = () => {
     DEFAULT_STREAM_ARGS.symbol,
   ]);
   const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
+  const [horizontalLinePriceInput, setHorizontalLinePriceInput] = useState("");
 
   const marketKind = useStore($marketKind);
   const symbol = useStore($marketSymbol);
@@ -1657,8 +1680,7 @@ export const MarketPriceChartIsland = () => {
     if (chart) {
       const interactive = selectedTool === "selection";
       chart.applyOptions({
-        handleScroll: interactive,
-        handleScale: interactive,
+        ...(interactive ? PRICE_CHART_INTERACTION_ENABLED : PRICE_CHART_INTERACTION_DISABLED),
       });
     }
 
@@ -1681,6 +1703,14 @@ export const MarketPriceChartIsland = () => {
   useEffect(() => {
     selectedDrawingIdRef.current = selectedDrawingId;
   }, [selectedDrawingId]);
+
+  useEffect(() => {
+    if (!selectedDrawing || selectedDrawing.type !== "horizontalLine") {
+      setHorizontalLinePriceInput("");
+      return;
+    }
+    setHorizontalLinePriceInput(String(selectedDrawing.price));
+  }, [selectedDrawing]);
 
   useEffect(() => {
     timeframeRef.current = timeframe;
@@ -1770,6 +1800,7 @@ export const MarketPriceChartIsland = () => {
         vertLine: { color: "#94a3b8", labelBackgroundColor: "#1e293b" },
         horzLine: { color: "#94a3b8", labelBackgroundColor: "#1e293b" },
       },
+      ...PRICE_CHART_INTERACTION_ENABLED,
     });
 
     const candleSeries = chart.addCandlestickSeries({
@@ -2440,6 +2471,40 @@ export const MarketPriceChartIsland = () => {
                 }
               }}
             />
+            {selectedDrawing.type === "horizontalLine" ? (
+              <input
+                aria-label="Precio exacto horizontal line"
+                className="w-[118px] rounded border border-slate-300 px-2 py-1 text-xs text-slate-900"
+                inputMode="decimal"
+                placeholder="Precio exacto"
+                value={horizontalLinePriceInput}
+                onChange={(event) => {
+                  const rawValue = event.target.value;
+                  setHorizontalLinePriceInput(rawValue);
+
+                  const normalized = rawValue.replace(",", ".");
+                  const nextPrice = Number(normalized);
+                  if (!Number.isFinite(nextPrice) || nextPrice <= 0) {
+                    return;
+                  }
+
+                  const updated = updateDrawingById(selectedDrawing.id, (drawing) => {
+                    if (drawing.type !== "horizontalLine") {
+                      return drawing;
+                    }
+                    return {
+                      ...drawing,
+                      price: nextPrice,
+                    };
+                  });
+
+                  if (updated) {
+                    persistSelectedDrawingStyle(updated, activeScope);
+                    requestOverlayRedraw();
+                  }
+                }}
+              />
+            ) : null}
             <button
               className="rounded border border-rose-300 bg-rose-50 px-2 py-1 font-semibold text-rose-700 hover:bg-rose-100"
               onClick={() => {

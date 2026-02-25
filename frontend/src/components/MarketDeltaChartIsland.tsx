@@ -2,6 +2,7 @@ import { useStore } from "@nanostores/react";
 import {
   createChart,
   LineStyle,
+  type AutoscaleInfo,
   type CandlestickData,
   type IChartApi,
   type ISeriesApi,
@@ -42,6 +43,28 @@ const hasTauriRuntime = (): boolean => {
     return false;
   }
   return "__TAURI_INTERNALS__" in window;
+};
+
+const deltaAutoscaleSymmetricAroundZero = (
+  baseImplementation: () => AutoscaleInfo | null,
+): AutoscaleInfo | null => {
+  const base = baseImplementation();
+  if (!base) {
+    return null;
+  }
+
+  const minVisible = base.priceRange.minValue;
+  const maxVisible = base.priceRange.maxValue;
+  const maxAbsVisible = Math.max(Math.abs(minVisible), Math.abs(maxVisible));
+  const range = Math.max(maxAbsVisible, 0.000_001);
+
+  return {
+    ...base,
+    priceRange: {
+      minValue: -range,
+      maxValue: range,
+    },
+  };
 };
 
 export const MarketDeltaChartIsland = () => {
@@ -99,6 +122,7 @@ export const MarketDeltaChartIsland = () => {
       wickDownColor: "#dc2626",
       priceLineVisible: false,
       lastValueVisible: false,
+      autoscaleInfoProvider: deltaAutoscaleSymmetricAroundZero,
     });
     deltaSeries.createPriceLine({
       price: 0,
