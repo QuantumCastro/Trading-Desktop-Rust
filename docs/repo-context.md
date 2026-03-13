@@ -11,8 +11,6 @@ Este documento resume decisiones vigentes del template después de la migración
 ## Decisiones clave
 
 - El template es **desktop-only**.
-- FastAPI/SQLModel/Orval fueron removidos del runtime principal.
-- NGINX y Docker Compose no forman parte del flujo oficial de ejecución.
 - Frontend: Astro SSG + React Islands.
 - Estado asíncrono: React Query sobre wrapper IPC tipado.
 - Persistencia: SQLite local con `sqlx` y migraciones versionadas.

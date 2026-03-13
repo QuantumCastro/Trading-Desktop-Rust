@@ -204,10 +204,7 @@ export const MarketDeltaChartIsland = () => {
     }
     updateLastKnownAbsDeltaFromCandles(deltaCandles);
     series.setData(deltaCandles.map(toDeltaPoint));
-    if (!visibleRange) {
-      chartRef.current?.timeScale().fitContent();
-    }
-  }, [deltaCandles, visibleRange]);
+  }, [deltaCandles]);
 
   useEffect(() => {
     const unlisten = $marketDeltaLiveUpdate.listen((update) => {
